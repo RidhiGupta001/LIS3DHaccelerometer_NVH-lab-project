@@ -1,0 +1,77 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <Adafruit_LIS3DH.h>
+#include <Adafruit_Sensor.h>
+
+#define LIS3DH_CS   21
+#define LIS3DH_MOSI 23
+#define LIS3DH_MISO 19
+#define LIS3DH_SCK  18
+
+Adafruit_LIS3DH lis = Adafruit_LIS3DH(LIS3DH_CS, LIS3DH_MOSI, LIS3DH_MISO, LIS3DH_SCK);
+
+// 100 Hz timing
+const unsigned long interval_us = 10000;  // 10 ms
+unsigned long previousMicros = 0;
+
+// Bias variables
+float bias_x = 0;
+float bias_y = 0;
+
+void setup() {
+  Serial.begin(115200);
+
+  if (!lis.begin()) {
+    while (1);
+  }
+
+  lis.setRange(LIS3DH_RANGE_2_G);
+  lis.setDataRate(LIS3DH_DATARATE_100_HZ);
+
+  delay(2000);  // let sensor settle
+
+  // --- Bias calibration (2 seconds averaging) ---
+  Serial.println("Calibrating...");
+  int samples = 200;
+  for (int i = 0; i < samples; i++) {
+    lis.read();
+    sensors_event_t event;
+    lis.getEvent(&event);
+
+    bias_x += event.acceleration.x;
+    bias_y += event.acceleration.y;
+    delay(10);
+  }
+
+  bias_x /= samples;
+  bias_y /= samples;
+
+  Serial.println("Calibration done");
+}
+
+void loop() {
+  unsigned long currentMicros = micros();
+
+  if (currentMicros - previousMicros >= interval_us) {
+    previousMicros += interval_us;
+
+    lis.read();
+    sensors_event_t event;
+    lis.getEvent(&event);
+
+    float ax = event.acceleration.x - bias_x;
+    float ay = event.acceleration.y - bias_y;
+    float az = event.acceleration.z;   // keep Z raw (gravity useful)
+
+    // VERY IMPORTANT: only numbers
+    Serial.print(">X:");
+Serial.println(ax,4);
+Serial.print(">Y:");
+Serial.println(ay,4);
+Serial.print(">Z:");
+Serial.println(az,4);
+float atotal = sqrt(ax*ax + ay*ay + az*az);
+Serial.print(">T:");
+Serial.println(atotal,4);
+  }
+}

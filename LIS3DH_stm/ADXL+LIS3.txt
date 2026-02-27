@@ -5,8 +5,8 @@
 #include <Adafruit_Sensor.h>
 
 // ── Pin Definitions ──────────────────────────────────────────────
-#define ADXL355_CS  5
-#define LIS3DH_CS   21
+#define ADXL355_CS  21
+#define LIS3DH_CS   5
 #define SPI_FREQ    1000000
 
 // ── ADXL355 Registers ────────────────────────────────────────────
@@ -20,8 +20,9 @@
 #define ADXL_REG_RESET      0x2F
 #define ADXL_SCALE_2G       (1.0f / 256000.0f)
 
-// ── LIS3DH via Adafruit Library (SPI) ────────────────────────────
-Adafruit_LIS3DH lis = Adafruit_LIS3DH();
+// ── LIS3DH: Hardware SPI constructor (CS pin only) ───────────────
+// Passing just CS tells the library to use hardware SPI
+Adafruit_LIS3DH lis = Adafruit_LIS3DH(LIS3DH_CS);
 
 // ── ADXL355 SPI Settings ─────────────────────────────────────────
 SPISettings adxlSettings(SPI_FREQ, MSBFIRST, SPI_MODE0);
@@ -90,21 +91,24 @@ void setup() {
     delay(2000);
     Serial.println("\n=== Dual Sensor Init ===");
 
-    // ADXL355 CS must be HIGH before SPI.begin
+    // Pull both CS HIGH before anything else
     pinMode(ADXL355_CS, OUTPUT);
+    pinMode(LIS3DH_CS,  OUTPUT);
     digitalWrite(ADXL355_CS, HIGH);
+    digitalWrite(LIS3DH_CS,  HIGH);
     delay(100);
 
-    SPI.begin(18, 19, 23);  // SCLK, MISO, MOSI
+    // Start SPI bus: SCLK=18, MISO=19, MOSI=23
+    SPI.begin(18, 19, 23);
+    delay(100);
 
     // ── Init ADXL355 ──────────────────────────────────────────
     Serial.println("\n--- ADXL355 ---");
     adxlWrite(ADXL_REG_RESET, 0x52);
     delay(100);
-
     uint8_t adxlId = adxlRead(ADXL_REG_DEVID_AD);
     Serial.printf("  DEVID_AD : 0x%02X (expect 0xAD) %s\n",
-                  adxlId, adxlId == 0xAD ? "✓ OK" : "✗ FAIL");
+                  adxlId, adxlId == 0xAD ? "OK" : "FAIL");
     Serial.printf("  DEVID_MST: 0x%02X (expect 0x1D)\n", adxlRead(ADXL_REG_DEVID_MST));
     Serial.printf("  PART_ID  : 0x%02X (expect 0xED)\n", adxlRead(ADXL_REG_PARTID));
 
@@ -116,23 +120,24 @@ void setup() {
         Serial.println("  ADXL355 NOT found - check wiring!");
     }
 
-    // ── Init LIS3DH via Adafruit library ──────────────────────
+    // ── Init LIS3DH ──────────────────────────────────────────
+    // The Adafruit_LIS3DH(CS) constructor uses hardware SPI
+    // lis.begin() with no args uses the SPI bus already started
     Serial.println("\n--- LIS3DH ---");
-    if (!lis.begin(LIS3DH_CS)) {
+    if (!lis.begin(0x18)) {
         Serial.println("  LIS3DH NOT found - check wiring!");
+        Serial.println("  (If wiring OK, try 0x19 as I2C address)");
     } else {
         lis.setRange(LIS3DH_RANGE_2_G);
         lis.setDataRate(LIS3DH_DATARATE_100_HZ);
         Serial.println("  LIS3DH ready!");
-        Serial.printf("  Range    : ±2g\n");
-        Serial.printf("  Data Rate: 100 Hz\n");
     }
 
     Serial.println("\n=== Streaming to Teleplot ===\n");
 }
 
 // ────────────────────────────────────────────────────────────────
-//  Loop — Teleplot output
+//  Loop
 // ────────────────────────────────────────────────────────────────
 void loop() {
     // ── ADXL355 ───────────────────────────────────────────────
@@ -146,10 +151,9 @@ void loop() {
 
     // ── LIS3DH ────────────────────────────────────────────────
     sensors_event_t event;
-    lis.getEvent(&event);   // returns acceleration in m/s²
+    lis.getEvent(&event);  // returns m/s²
 
-    // Convert m/s² → g  (divide by 9.80665)
-    float lx = event.acceleration.x / 9.80665f;
+    float lx = event.acceleration.x / 9.80665f;  // convert to g
     float ly = event.acceleration.y / 9.80665f;
     float lz = event.acceleration.z / 9.80665f;
     float lt = sqrt(lx*lx + ly*ly + lz*lz);

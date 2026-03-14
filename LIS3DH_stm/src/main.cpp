@@ -20,16 +20,90 @@
 #define ADXL_REG_RESET      0x2F
 #define ADXL_SCALE_2G       (1.0f / 256000.0f)
 
-// ── LIS3DH: Hardware SPI constructor (CS pin only) ───────────────
-// Passing just CS tells the library to use hardware SPI
+// ── FFT Configuration ─────────────────────────────────────────────
+// FFT_SIZE must be a power of 2.
+// Effective sample rate ~100 Hz (loop delay 10ms).
+// Frequency resolution = SAMPLE_RATE / FFT_SIZE
+#define FFT_SIZE    128
+#define SAMPLE_RATE 100.0f
+#define FFT_BINS    (FFT_SIZE / 2)
+
+// ── LIS3DH ───────────────────────────────────────────────────────
 Adafruit_LIS3DH lis = Adafruit_LIS3DH(LIS3DH_CS);
 
 // ── ADXL355 SPI Settings ─────────────────────────────────────────
 SPISettings adxlSettings(SPI_FREQ, MSBFIRST, SPI_MODE0);
 
+// ── FFT Buffers ───────────────────────────────────────────────────
+float adxl_xBuf[FFT_SIZE], adxl_yBuf[FFT_SIZE], adxl_zBuf[FFT_SIZE];
+float lis_xBuf[FFT_SIZE],  lis_yBuf[FFT_SIZE],  lis_zBuf[FFT_SIZE];
+float re[FFT_SIZE], im[FFT_SIZE];  // shared working arrays
+
+int sampleIndex = 0;
+
 // ────────────────────────────────────────────────────────────────
-//  ADXL355 Helpers
+//  In-place Cooley–Tukey radix-2 FFT
 // ────────────────────────────────────────────────────────────────
+void fft(float* re, float* im, int n) {
+    // Bit-reversal permutation
+    for (int i = 1, j = 0; i < n; i++) {
+        int bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) {
+            float tr = re[i]; re[i] = re[j]; re[j] = tr;
+            float ti = im[i]; im[i] = im[j]; im[j] = ti;
+        }
+    }
+    // Butterfly passes
+    for (int len = 2; len <= n; len <<= 1) {
+        float ang = -2.0f * M_PI / len;
+        float wRe = cosf(ang), wIm = sinf(ang);
+        for (int i = 0; i < n; i += len) {
+            float curRe = 1.0f, curIm = 0.0f;
+            for (int j = 0; j < len / 2; j++) {
+                float uRe = re[i + j], uIm = im[i + j];
+                float vRe = re[i + j + len/2] * curRe - im[i + j + len/2] * curIm;
+                float vIm = re[i + j + len/2] * curIm + im[i + j + len/2] * curRe;
+                re[i + j]         = uRe + vRe;
+                im[i + j]         = uIm + vIm;
+                re[i + j + len/2] = uRe - vRe;
+                im[i + j + len/2] = uIm - vIm;
+                float newRe = curRe * wRe - curIm * wIm;
+                float newIm = curRe * wIm + curIm * wRe;
+                curRe = newRe; curIm = newIm;
+            }
+        }
+    }
+}
+
+// ── Hanning Window ────────────────────────────────────────────────
+void applyHanning(float* data, int n) {
+    for (int i = 0; i < n; i++) {
+        float w = 0.5f * (1.0f - cosf(2.0f * M_PI * i / (n - 1)));
+        data[i] *= w;
+    }
+}
+
+// ── Compute FFT and send as Teleplot XY series ────────────────────
+// Teleplot XY format: >name:x:y  (x = freq Hz, y = magnitude g)
+void sendFFT(const char* label, float* timeBuf) {
+    for (int i = 0; i < FFT_SIZE; i++) {
+        re[i] = timeBuf[i];
+        im[i] = 0.0f;
+    }
+    applyHanning(re, FFT_SIZE);
+    fft(re, im, FFT_SIZE);
+
+    // Send bins 1..FFT_BINS-1  (skip DC bin 0)
+    for (int k = 1; k < FFT_BINS; k++) {
+        float freq = k * (SAMPLE_RATE / FFT_SIZE);
+        float mag  = sqrtf(re[k]*re[k] + im[k]*im[k]) / FFT_BINS;
+        Serial.printf(">%s:%.3f:%.6f\n", label, freq, mag);
+    }
+}
+
+// ── ADXL355 Helpers ───────────────────────────────────────────────
 uint8_t adxlRead(uint8_t reg) {
     uint8_t result;
     SPI.beginTransaction(adxlSettings);
@@ -64,9 +138,6 @@ int32_t adxlTwosComp20(uint32_t raw) {
     return (int32_t)raw;
 }
 
-// ────────────────────────────────────────────────────────────────
-//  Data Struct
-// ────────────────────────────────────────────────────────────────
 struct AccelData { float x, y, z, total; };
 
 AccelData readADXL355() {
@@ -79,7 +150,7 @@ AccelData readADXL355() {
     d.x = adxlTwosComp20(rawX) * ADXL_SCALE_2G;
     d.y = adxlTwosComp20(rawY) * ADXL_SCALE_2G;
     d.z = adxlTwosComp20(rawZ) * ADXL_SCALE_2G;
-    d.total = sqrt(d.x*d.x + d.y*d.y + d.z*d.z);
+    d.total = sqrtf(d.x*d.x + d.y*d.y + d.z*d.z);
     return d;
 }
 
@@ -91,18 +162,16 @@ void setup() {
     delay(2000);
     Serial.println("\n=== Dual Sensor Init ===");
 
-    // Pull both CS HIGH before anything else
     pinMode(ADXL355_CS, OUTPUT);
     pinMode(LIS3DH_CS,  OUTPUT);
     digitalWrite(ADXL355_CS, HIGH);
     digitalWrite(LIS3DH_CS,  HIGH);
     delay(100);
 
-    // Start SPI bus: SCLK=18, MISO=19, MOSI=23
     SPI.begin(18, 19, 23);
     delay(100);
 
-    // ── Init ADXL355 ──────────────────────────────────────────
+    // ── Init ADXL355 ──
     Serial.println("\n--- ADXL355 ---");
     adxlWrite(ADXL_REG_RESET, 0x52);
     delay(100);
@@ -120,48 +189,77 @@ void setup() {
         Serial.println("  ADXL355 NOT found - check wiring!");
     }
 
-    // ── Init LIS3DH ──────────────────────────────────────────
-    // The Adafruit_LIS3DH(CS) constructor uses hardware SPI
-    // lis.begin() with no args uses the SPI bus already started
+    // ── Init LIS3DH ──
     Serial.println("\n--- LIS3DH ---");
     if (!lis.begin(0x18)) {
         Serial.println("  LIS3DH NOT found - check wiring!");
-        Serial.println("  (If wiring OK, try 0x19 as I2C address)");
     } else {
         lis.setRange(LIS3DH_RANGE_2_G);
         lis.setDataRate(LIS3DH_DATARATE_100_HZ);
         Serial.println("  LIS3DH ready!");
     }
 
-    Serial.println("\n=== Streaming to Teleplot ===\n");
+    memset(adxl_xBuf, 0, sizeof(adxl_xBuf));
+    memset(adxl_yBuf, 0, sizeof(adxl_yBuf));
+    memset(adxl_zBuf, 0, sizeof(adxl_zBuf));
+    memset(lis_xBuf,  0, sizeof(lis_xBuf));
+    memset(lis_yBuf,  0, sizeof(lis_yBuf));
+    memset(lis_zBuf,  0, sizeof(lis_zBuf));
+
+    Serial.println("\n=== Streaming to Teleplot ===");
+    Serial.printf("    FFT size      : %d samples\n",    FFT_SIZE);
+    Serial.printf("    Sample rate   : %.0f Hz\n",       SAMPLE_RATE);
+    Serial.printf("    Freq resolut. : %.3f Hz/bin\n",   SAMPLE_RATE / FFT_SIZE);
+    Serial.printf("    Max frequency : %.1f Hz\n\n",     SAMPLE_RATE / 2.0f);
 }
 
 // ────────────────────────────────────────────────────────────────
 //  Loop
 // ────────────────────────────────────────────────────────────────
 void loop() {
-    // ── ADXL355 ───────────────────────────────────────────────
+    // ── ADXL355 ──
     if (adxlRead(ADXL_REG_STATUS) & 0x01) {
         AccelData a = readADXL355();
         Serial.printf(">ADXL_Ax:%f\n",     a.x);
         Serial.printf(">ADXL_Ay:%f\n",     a.y);
         Serial.printf(">ADXL_Az:%f\n",     a.z);
         Serial.printf(">ADXL_Atotal:%f\n", a.total);
+
+        adxl_xBuf[sampleIndex] = a.x;
+        adxl_yBuf[sampleIndex] = a.y;
+        adxl_zBuf[sampleIndex] = a.z;
     }
 
-    // ── LIS3DH ────────────────────────────────────────────────
+    // ── LIS3DH ──
     sensors_event_t event;
-    lis.getEvent(&event);  // returns m/s²
-
-    float lx = event.acceleration.x / 9.80665f;  // convert to g
+    lis.getEvent(&event);
+    float lx = event.acceleration.x / 9.80665f;
     float ly = event.acceleration.y / 9.80665f;
     float lz = event.acceleration.z / 9.80665f;
-    float lt = sqrt(lx*lx + ly*ly + lz*lz);
+    float lt = sqrtf(lx*lx + ly*ly + lz*lz);
 
     Serial.printf(">LIS_Ax:%f\n",     lx);
     Serial.printf(">LIS_Ay:%f\n",     ly);
     Serial.printf(">LIS_Az:%f\n",     lz);
     Serial.printf(">LIS_Atotal:%f\n", lt);
 
-    delay(10);
+    lis_xBuf[sampleIndex] = lx;
+    lis_yBuf[sampleIndex] = ly;
+    lis_zBuf[sampleIndex] = lz;
+
+    sampleIndex++;
+
+    // ── When buffer full → compute & send FFT ──
+    // Fires every 128 × 10 ms = 1.28 s
+    if (sampleIndex >= FFT_SIZE) {
+        sampleIndex = 0;
+        sendFFT("ADXL_FFT_X", adxl_xBuf);
+        sendFFT("ADXL_FFT_Y", adxl_yBuf);
+        sendFFT("ADXL_FFT_Z", adxl_zBuf);
+        sendFFT("LIS_FFT_X",  lis_xBuf);
+        sendFFT("LIS_FFT_Y",  lis_yBuf);
+        sendFFT("LIS_FFT_Z",  lis_zBuf);
+    }
+
+    delay(10);  // 10 ms → 100 Hz sample rate
 }

@@ -1,0 +1,81 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <Adafruit_LIS3DH.h>
+#include <Adafruit_Sensor.h>
+
+#define LIS3DH_CS   21
+#define LIS3DH_MOSI 23
+#define LIS3DH_MISO 19
+#define LIS3DH_SCK  18
+
+Adafruit_LIS3DH lis = Adafruit_LIS3DH(LIS3DH_CS, LIS3DH_MOSI, LIS3DH_MISO, LIS3DH_SCK);
+
+const uint32_t INTERVAL_US = 1250; // 800 Hz sampling
+uint32_t lastMicros = 0;
+
+float bias_x = 0;
+float bias_y = 0;
+float bias_z = 0;
+
+void setup() {
+    Serial.begin(921600);
+
+    if (!lis.begin()) {
+        Serial.println("LIS3DH not found!");
+        while (1);
+    }
+
+    lis.setRange(LIS3DH_RANGE_2_G);
+    lis.setDataRate(LIS3DH_DATARATE_LOWPOWER_1K6HZ);
+
+    Serial.println("Calibrating — keep sensor still...");
+    delay(500);
+
+    const int CAL_SAMPLES = 500;
+    double sum_x = 0, sum_y = 0, sum_z = 0;
+
+    for (int i = 0; i < CAL_SAMPLES; i++) {
+        sensors_event_t event;
+        lis.getEvent(&event);
+        sum_x += event.acceleration.x;
+        sum_y += event.acceleration.y;
+        sum_z += event.acceleration.z;
+        delayMicroseconds(1250);
+    }
+
+    bias_x = sum_x / CAL_SAMPLES;
+    bias_y = sum_y / CAL_SAMPLES;
+    bias_z = (sum_z / CAL_SAMPLES) - 9.80665f;
+
+    Serial.println("Calibration done.");
+    Serial.print("Bias X: "); Serial.println(bias_x, 4);
+    Serial.print("Bias Y: "); Serial.println(bias_y, 4);
+    Serial.print("Bias Z: "); Serial.println(bias_z, 4);
+
+    lastMicros = micros();
+}
+
+void loop() {
+    uint32_t now = micros();
+
+    if (now - lastMicros >= INTERVAL_US) {
+        lastMicros += INTERVAL_US;
+
+        sensors_event_t event;
+        lis.getEvent(&event);
+
+        float ax = event.acceleration.x - bias_x;
+        float ay = event.acceleration.y - bias_y;
+        float az = event.acceleration.z - bias_z;
+
+        float gx = ax / 9.80665f;
+        float gy = ay / 9.80665f;
+        float gz = az / 9.80665f;
+        float gt = sqrtf(gx*gx + gy*gy + gz*gz);
+
+        Serial.print(">X:"); Serial.println(gx, 4);
+        Serial.print(">Y:"); Serial.println(gy, 4);
+        Serial.print(">Z:"); Serial.println(gz, 4);
+        Serial.print(">T:"); Serial.println(gt, 4);
+    }
+}

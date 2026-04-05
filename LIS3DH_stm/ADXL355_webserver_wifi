@@ -1,0 +1,456 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <math.h>
+#include <WiFi.h>
+#include <WebSocketsServer.h>
+#include <WebServer.h>
+
+const char* SSID     = "vi";
+const char* PASSWORD = "14092005";
+
+#define CS_PIN    5
+#define SPI_FREQ  1000000
+
+#define REG_DEVID_AD    0x00
+#define REG_DEVID_MST   0x01
+#define REG_PARTID      0x02
+#define REG_STATUS      0x04
+#define REG_XDATA3      0x08
+#define REG_FILTER      0x28
+#define REG_RANGE       0x2C
+#define REG_POWER_CTL   0x2D
+#define REG_RESET       0x2F
+
+#define SCALE_FACTOR_2G (1.0f / 256000.0f)
+
+SPISettings adxl355Settings(SPI_FREQ, MSBFIRST, SPI_MODE0);
+
+WebSocketsServer wsServer(81);
+WebServer        httpServer(80);
+
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ADXL355 Live</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: monospace; background: #111; color: #eee; padding: 16px; }
+    h1 { color: #0f0; margin-bottom: 16px; font-size: 1.2em; }
+
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 10px;
+      margin-bottom: 16px;
+    }
+    .card {
+      background: #1a1a1a;
+      border: 1px solid #2a2a2a;
+      border-radius: 8px;
+      padding: 12px;
+    }
+    .card .label { font-size: 0.7em; color: #888; margin-bottom: 4px; }
+    .card .value { font-size: 1.6em; }
+    .card.x .value { color: #f55; }
+    .card.y .value { color: #5f5; }
+    .card.z .value { color: #55f; }
+    .card.t .value { color: #fa0; }
+
+    .toolbar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+    }
+    .toolbar button {
+      background: #1a1a1a;
+      border: 1px solid #333;
+      color: #eee;
+      padding: 7px 14px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-family: monospace;
+      font-size: 0.85em;
+    }
+    .toolbar button:hover { background: #252525; }
+    .toolbar button.danger  { border-color: #f55; color: #f55; }
+    .toolbar button.primary { border-color: #0f0; color: #0f0; }
+    .pill {
+      font-size: 0.7em; padding: 3px 8px;
+      border-radius: 20px; background: #222;
+      color: #888; border: 1px solid #333;
+    }
+    .status { font-size: 0.75em; color: #888; margin-left: auto; }
+    .status.connected    { color: #0f0; }
+    .status.disconnected { color: #f55; }
+
+    .charts-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+    .chart-box {
+      background: #1a1a1a;
+      border: 1px solid #2a2a2a;
+      border-radius: 8px;
+      padding: 10px 12px 8px;
+    }
+    .chart-box .ch-title {
+      font-size: 0.7em;
+      color: #888;
+      margin-bottom: 6px;
+    }
+    .chart-box canvas {
+      display: block;
+      width: 100% !important;
+      height: 160px;
+    }
+  </style>
+</head>
+<body>
+
+<h1>ADXL355 Live Stream</h1>
+
+<div class="toolbar">
+  <button class="primary" onclick="downloadCSV()">⬇ Download CSV</button>
+  <button class="danger"  onclick="clearBuffer()">✕ Clear buffer</button>
+  <span class="pill" id="count">0 samples</span>
+  <span class="pill" id="duration">0s stored</span>
+  <span class="status disconnected" id="status">● Disconnected</span>
+</div>
+
+<div class="cards">
+  <div class="card x"><div class="label">X (g)</div><div class="value" id="vx">--</div></div>
+  <div class="card y"><div class="label">Y (g)</div><div class="value" id="vy">--</div></div>
+  <div class="card z"><div class="label">Z (g)</div><div class="value" id="vz">--</div></div>
+  <div class="card t"><div class="label">Total (g)</div><div class="value" id="vt">--</div></div>
+</div>
+
+<div class="charts-grid">
+  <div class="chart-box">
+    <div class="ch-title">X axis (g)</div>
+    <canvas id="cx"></canvas>
+  </div>
+  <div class="chart-box">
+    <div class="ch-title">Y axis (g)</div>
+    <canvas id="cy"></canvas>
+  </div>
+  <div class="chart-box">
+    <div class="ch-title">Z axis (g)</div>
+    <canvas id="cz"></canvas>
+  </div>
+  <div class="chart-box">
+    <div class="ch-title">Total magnitude (g)</div>
+    <canvas id="ct"></canvas>
+  </div>
+</div>
+
+<script>
+  // ── Config ────────────────────────────────────────────────────────
+  const BUFFER_MS   = 2 * 60 * 1000;
+  const MAX_DISPLAY = 600;
+  const WS_URL      = 'ws://' + location.hostname + ':81';
+
+  // ── Buffer ────────────────────────────────────────────────────────
+  const buffer = [];
+  const t0 = Date.now();
+
+  // ── Canvas chart renderer (no external library) ───────────────────
+  const COLORS = { cx:'#f55', cy:'#5f5', cz:'#55f', ct:'#fa0' };
+  const canvases = ['cx','cy','cz','ct'];
+  const dataKeys = ['x','y','z','total'];
+
+  // Set physical pixel size of each canvas
+  function resizeCanvas(c) {
+    const box = c.parentElement;
+    c.width  = box.clientWidth - 24;   // subtract padding
+    c.height = 160;
+  }
+
+  canvases.forEach(id => resizeCanvas(document.getElementById(id)));
+  window.addEventListener('resize', () => {
+    canvases.forEach(id => {
+      resizeCanvas(document.getElementById(id));
+    });
+    drawAll();
+  });
+
+  function drawChart(canvasId, key, color) {
+    const c   = document.getElementById(canvasId);
+    const ctx = c.getContext('2d');
+    const W   = c.width, H = c.height;
+    const PAD = { top: 10, bottom: 22, left: 46, right: 8 };
+    const IW  = W - PAD.left - PAD.right;
+    const IH  = H - PAD.top  - PAD.bottom;
+
+    ctx.clearRect(0, 0, W, H);
+
+    // Background
+    ctx.fillStyle = '#1a1a1a';
+    ctx.fillRect(0, 0, W, H);
+
+    if (buffer.length < 2) {
+      ctx.fillStyle = '#444';
+      ctx.font = '12px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('Waiting for data...', W/2, H/2);
+      return;
+    }
+
+    // Downsample
+    const step = Math.max(1, Math.floor(buffer.length / MAX_DISPLAY));
+    const pts  = [];
+    for (let i = 0; i < buffer.length; i += step) pts.push(buffer[i]);
+
+    // Value range with a minimum span so flat lines still show
+    let mn = Infinity, mx = -Infinity;
+    pts.forEach(p => { if (p[key] < mn) mn = p[key]; if (p[key] > mx) mx = p[key]; });
+    const span = Math.max(mx - mn, 0.002);
+    mn -= span * 0.1;
+    mx += span * 0.1;
+
+    // Time range
+    const t1 = pts[0].t, t2 = pts[pts.length-1].t;
+    const tSpan = Math.max(t2 - t1, 1);
+
+    // Grid lines + Y labels
+    const yTicks = 4;
+    ctx.strokeStyle = '#222';
+    ctx.lineWidth   = 1;
+    ctx.fillStyle   = '#555';
+    ctx.font        = '10px monospace';
+    ctx.textAlign   = 'right';
+    for (let i = 0; i <= yTicks; i++) {
+      const v  = mn + (mx - mn) * (i / yTicks);
+      const py = PAD.top + IH - (i / yTicks) * IH;
+      ctx.beginPath();
+      ctx.moveTo(PAD.left, py);
+      ctx.lineTo(W - PAD.right, py);
+      ctx.stroke();
+      ctx.fillText(v.toFixed(4), PAD.left - 4, py + 3);
+    }
+
+    // X time labels
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#555';
+    const xTicks = 5;
+    for (let i = 0; i <= xTicks; i++) {
+      const t  = t1 + tSpan * (i / xTicks);
+      const px = PAD.left + (i / xTicks) * IW;
+      ctx.fillText(((t)/1000).toFixed(1)+'s', px, H - 4);
+    }
+
+    // Data line
+    ctx.beginPath();
+    ctx.strokeStyle = color;
+    ctx.lineWidth   = 1.5;
+    ctx.lineJoin    = 'round';
+    pts.forEach((p, i) => {
+      const px = PAD.left + ((p.t - t1) / tSpan) * IW;
+      const py = PAD.top  + IH - ((p[key] - mn) / (mx - mn)) * IH;
+      i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+    });
+    ctx.stroke();
+
+    // Border
+    ctx.strokeStyle = '#2a2a2a';
+    ctx.lineWidth   = 1;
+    ctx.strokeRect(PAD.left, PAD.top, IW, IH);
+  }
+
+  function drawAll() {
+    canvases.forEach((id, i) => drawChart(id, dataKeys[i], COLORS[id]));
+  }
+
+  // ── Render loop (60fps cap via rAF) ──────────────────────────────
+  let dirty = false;
+  function scheduleRender() {
+    if (dirty) return;
+    dirty = true;
+    requestAnimationFrame(() => {
+      dirty = false;
+      drawAll();
+      // Update pills
+      document.getElementById('count').textContent =
+        buffer.length.toLocaleString() + ' samples';
+      if (buffer.length > 1) {
+        const secs = ((buffer[buffer.length-1].t - buffer[0].t)/1000).toFixed(1);
+        document.getElementById('duration').textContent = secs + 's stored';
+      }
+    });
+  }
+
+  // ── WebSocket ────────────────────────────────────────────────────
+  let ws;
+  function connect() {
+    ws = new WebSocket(WS_URL);
+    ws.onopen  = () => {
+      document.getElementById('status').textContent = '● Connected';
+      document.getElementById('status').className  = 'status connected';
+    };
+    ws.onclose = () => {
+      document.getElementById('status').textContent = '● Disconnected';
+      document.getElementById('status').className  = 'status disconnected';
+      setTimeout(connect, 2000);
+    };
+    ws.onmessage = (evt) => {
+      const d   = JSON.parse(evt.data);
+      const now = Date.now() - t0;
+      buffer.push({ t: now, x: d.x, y: d.y, z: d.z, total: d.total });
+      const cutoff = now - BUFFER_MS;
+      while (buffer.length && buffer[0].t < cutoff) buffer.shift();
+
+      document.getElementById('vx').textContent = d.x.toFixed(5);
+      document.getElementById('vy').textContent = d.y.toFixed(5);
+      document.getElementById('vz').textContent = d.z.toFixed(5);
+      document.getElementById('vt').textContent = d.total.toFixed(5);
+      scheduleRender();
+    };
+  }
+  connect();
+
+  // ── CSV download ─────────────────────────────────────────────────
+  function downloadCSV() {
+    if (!buffer.length) { alert('No data yet.'); return; }
+    const rows = ['time_ms,x_g,y_g,z_g,total_g'];
+    buffer.forEach(r => rows.push(`${r.t},${r.x},${r.y},${r.z},${r.total}`));
+    const blob = new Blob([rows.join('\n')], { type: 'text/csv' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url;
+    a.download = 'adxl355_' + new Date().toISOString().slice(0,19).replace(/:/g,'-') + '.csv';
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  // ── Clear ────────────────────────────────────────────────────────
+  function clearBuffer() {
+    buffer.length = 0;
+    drawAll();
+    document.getElementById('count').textContent    = '0 samples';
+    document.getElementById('duration').textContent = '0s stored';
+  }
+</script>
+</body>
+</html>
+)rawliteral";
+
+void csLow()  { digitalWrite(CS_PIN, LOW);  }
+void csHigh() { digitalWrite(CS_PIN, HIGH); }
+
+uint8_t readRegister(uint8_t reg) {
+    SPI.beginTransaction(adxl355Settings); csLow();
+    SPI.transfer((reg << 1) | 0x01);
+    uint8_t r = SPI.transfer(0x00);
+    csHigh(); SPI.endTransaction(); return r;
+}
+void writeRegister(uint8_t reg, uint8_t value) {
+    SPI.beginTransaction(adxl355Settings); csLow();
+    SPI.transfer((reg << 1) & 0xFE); SPI.transfer(value);
+    csHigh(); SPI.endTransaction();
+}
+void readRegisters(uint8_t startReg, uint8_t* buffer, uint8_t length) {
+    SPI.beginTransaction(adxl355Settings); csLow();
+    SPI.transfer((startReg << 1) | 0x01);
+    for (uint8_t i = 0; i < length; i++) buffer[i] = SPI.transfer(0x00);
+    csHigh(); SPI.endTransaction();
+}
+int32_t twosComplement20(uint32_t raw) {
+    raw &= 0x000FFFFF;
+    if (raw & 0x00080000) return (int32_t)(raw | 0xFFF00000);
+    return (int32_t)raw;
+}
+
+struct AccelData { float x, y, z; };
+
+AccelData readAcceleration() {
+    uint8_t buf[9]; readRegisters(REG_XDATA3, buf, 9);
+    AccelData data;
+    data.x = twosComplement20(((uint32_t)buf[0]<<12)|((uint32_t)buf[1]<<4)|(buf[2]>>4)) * SCALE_FACTOR_2G;
+    data.y = twosComplement20(((uint32_t)buf[3]<<12)|((uint32_t)buf[4]<<4)|(buf[5]>>4)) * SCALE_FACTOR_2G;
+    data.z = twosComplement20(((uint32_t)buf[6]<<12)|((uint32_t)buf[7]<<4)|(buf[8]>>4)) * SCALE_FACTOR_2G;
+    return data;
+}
+
+void setup() {
+    Serial.begin(115200);
+    delay(2000);
+
+    // ── WiFi debug ────────────────────────────────────────────────────
+    Serial.println("\n\n--- WiFi Setup ---");
+    Serial.printf("Connecting to SSID: '%s'\n", SSID);
+
+WiFi.disconnect(true);
+delay(500);
+WiFi.mode(WIFI_STA);
+WiFi.setMinSecurity(WIFI_AUTH_WEP);   // be permissive with security type
+WiFi.setSleep(false);                  // disable WiFi sleep — fixes many ESP32 drop issues
+WiFi.begin(SSID, PASSWORD);
+
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.printf("  attempt %d — status code: %d\n", ++attempts, WiFi.status());
+        if (attempts >= 20) {
+            Serial.println("FAILED after 20 attempts. Check SSID/password and that it's 2.4GHz.");
+            Serial.println("Continuing without WiFi — sensor still works via Serial.");
+            break;   // don't hang forever
+        }
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.print("Connected! Dashboard at: http://");
+        Serial.println(WiFi.localIP());
+        httpServer.on("/", []() {
+            httpServer.send_P(200, "text/html", INDEX_HTML);
+        });
+        httpServer.begin();
+        wsServer.begin();
+    }
+    // ─────────────────────────────────────────────────────────────────
+
+    // Sensor init (unchanged)
+    pinMode(CS_PIN, OUTPUT); csHigh(); delay(100);
+    SPI.begin(18, 19, 23, 5);
+    writeRegister(REG_RESET, 0x52); delay(100);
+
+    uint8_t devId  = readRegister(REG_DEVID_AD);
+    uint8_t mstId  = readRegister(REG_DEVID_MST);
+    uint8_t partId = readRegister(REG_PARTID);
+    if (devId != 0xAD || mstId != 0x1D || partId != 0xED) {
+        Serial.println("ERROR: ADXL355 not found!"); while (true) delay(1000);
+    }
+
+    writeRegister(REG_RANGE,     0x01);
+    writeRegister(REG_FILTER,    0x33);
+    writeRegister(REG_POWER_CTL, 0x00);
+    delay(100);
+    Serial.println("Sensor ready.");
+}
+
+void loop() {
+    httpServer.handleClient();
+    wsServer.loop();
+
+    if (readRegister(REG_STATUS) & 0x01) {
+        AccelData a = readAcceleration();
+        float total = sqrtf(a.x*a.x + a.y*a.y + a.z*a.z);
+
+        char json[96];
+        snprintf(json, sizeof(json),
+            "{\"x\":%.6f,\"y\":%.6f,\"z\":%.6f,\"total\":%.6f}",
+            a.x, a.y, a.z, total);
+
+        wsServer.broadcastTXT(json);
+
+        Serial.printf(">Ax:%f\n", a.x);
+        Serial.printf(">Ay:%f\n", a.y);
+        Serial.printf(">Az:%f\n", a.z);
+        Serial.printf(">Atotal:%f\n", total);
+    }
+    delay(2);
+}

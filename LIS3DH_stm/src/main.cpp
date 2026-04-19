@@ -1,444 +1,81 @@
 #include <Arduino.h>
 #include <SPI.h>
-#include <math.h>
-#include <WiFi.h>
-#include <WebSocketsServer.h>
-#include <WebServer.h>
+#include <Adafruit_LIS3DH.h>
+#include <Adafruit_Sensor.h>
 
-const char* SSID     = "EACCESS-PG";
-const char* PASSWORD = "hostelnet";
+#define LIS3DH_CS   5
+#define LIS3DH_MOSI 23
+#define LIS3DH_MISO 19
+#define LIS3DH_SCK  18
 
-#define CS_PIN    5
-#define SPI_FREQ  1000000
+Adafruit_LIS3DH lis = Adafruit_LIS3DH(LIS3DH_CS, LIS3DH_MOSI, LIS3DH_MISO, LIS3DH_SCK);
 
-#define REG_DEVID_AD    0x00
-#define REG_DEVID_MST   0x01
-#define REG_PARTID      0x02
-#define REG_STATUS      0x04
-#define REG_XDATA3      0x08
-#define REG_FILTER      0x28
-#define REG_RANGE       0x2C
-#define REG_POWER_CTL   0x2D
-#define REG_RESET       0x2F
+const uint32_t INTERVAL_US = 1250; // 800 Hz sampling
+uint32_t lastMicros = 0;
 
-// ±4g range: 1g = 128000 LSB
-#define SCALE_FACTOR_4G (1.0f / 128000.0f)
+float bias_x = 0;
+float bias_y = 0;
+float bias_z = 0;
 
-// REG_FILTER = 0x?? breakdown:
-//   Upper nibble = HPF corner:  0x1 = 24.7 × 10^-4 × ODR  (removes gravity DC)
-//   Lower nibble = ODR + LPF:   0x4 = 200 Hz ODR, 50 Hz LPF
-//   Combined: 0x14
-#define FILTER_200HZ_HPF  0x14
-
-SPISettings adxl355Settings(SPI_FREQ, MSBFIRST, SPI_MODE0);
-
-WebSocketsServer wsServer(81);
-WebServer        httpServer(80);
-
-const char INDEX_HTML[] PROGMEM = R"rawliteral(
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ADXL355 Vibration</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: monospace; background: #111; color: #eee; padding: 16px; }
-    h1 { color: #0f0; margin-bottom: 16px; font-size: 1.2em; }
-    .toolbar {
-      display: flex; align-items: center;
-      gap: 10px; margin-bottom: 16px; flex-wrap: wrap;
-    }
-    .toolbar button {
-      background: #1a1a1a; border: 1px solid #333;
-      color: #eee; padding: 7px 14px; border-radius: 6px;
-      cursor: pointer; font-family: monospace; font-size: 0.85em;
-    }
-    .toolbar button:hover { background: #252525; }
-    .toolbar button.danger  { border-color: #f55; color: #f55; }
-    .toolbar button.primary { border-color: #0f0; color: #0f0; }
-    .pill {
-      font-size: 0.7em; padding: 3px 8px; border-radius: 20px;
-      background: #222; color: #888; border: 1px solid #333;
-    }
-    .status { font-size: 0.75em; margin-left: auto; }
-    .status.connected    { color: #0f0; }
-    .status.disconnected { color: #f55; }
-    .cards {
-      display: grid; grid-template-columns: repeat(4,1fr);
-      gap: 10px; margin-bottom: 16px;
-    }
-    .card {
-      background: #1a1a1a; border: 1px solid #2a2a2a;
-      border-radius: 8px; padding: 12px;
-    }
-    .card .label { font-size: 0.7em; color: #888; margin-bottom: 4px; }
-    .card .value { font-size: 1.5em; }
-    .card.x .value { color: #f55; }
-    .card.y .value { color: #5f5; }
-    .card.z .value { color: #55f; }
-    .card.t .value { color: #fa0; }
-    .charts-grid {
-      display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
-    }
-    .chart-box {
-      background: #1a1a1a; border: 1px solid #2a2a2a;
-      border-radius: 8px; padding: 10px 12px 8px;
-    }
-    .chart-box .ch-title { font-size: 0.7em; color: #888; margin-bottom: 6px; }
-    .chart-box canvas { display: block; width: 100% !important; height: 160px; }
-  </style>
-</head>
-<body>
-<h1>ADXL355 Vibration Monitor — 200 Hz</h1>
-
-<div class="toolbar">
-  <button class="primary" onclick="downloadCSV()">Download CSV</button>
-  <button class="danger"  onclick="clearBuffer()">Clear buffer</button>
-  <span class="pill" id="count">0 samples</span>
-  <span class="pill" id="rate">0 Hz</span>
-  <span class="pill" id="duration">0s stored</span>
-  <span class="status disconnected" id="status">Disconnected</span>
-</div>
-
-<div class="cards">
-  <div class="card x"><div class="label">X (g) — vibration</div><div class="value" id="vx">--</div></div>
-  <div class="card y"><div class="label">Y (g) — vibration</div><div class="value" id="vy">--</div></div>
-  <div class="card z"><div class="label">Z (g) — vibration</div><div class="value" id="vz">--</div></div>
-  <div class="card t"><div class="label">RMS total (g)</div><div class="value" id="vt">--</div></div>
-</div>
-
-<div class="charts-grid">
-  <div class="chart-box"><div class="ch-title">X axis — vibration (g)</div><canvas id="cx"></canvas></div>
-  <div class="chart-box"><div class="ch-title">Y axis — vibration (g)</div><canvas id="cy"></canvas></div>
-  <div class="chart-box"><div class="ch-title">Z axis — vibration (g)</div><canvas id="cz"></canvas></div>
-  <div class="chart-box"><div class="ch-title">Total magnitude (g)</div><canvas id="ct"></canvas></div>
-</div>
-
-<script>
-  const BUFFER_SECS = 120;       // 2 minutes
-  const ODR        = 200;        // samples per second
-  const MAX_BUFFER = BUFFER_SECS * ODR;  // 24000 samples max
-  const MAX_DISPLAY = 600;       // points drawn on canvas
-
-  const buffer = [];
-
-  // ── Actual sample rate measurement ───────────────────────────────
-  let rateCounter = 0, rateTimer = Date.now();
-
-  // ── Canvas setup ─────────────────────────────────────────────────
-  const COLORS = { cx:'#f55', cy:'#5f5', cz:'#55f', ct:'#fa0' };
-  const canvasIds = ['cx','cy','cz','ct'];
-  const dataKeys  = ['x','y','z','total'];
-
-  function resizeCanvas(c) {
-    c.width  = c.parentElement.clientWidth - 24;
-    c.height = 160;
-  }
-  canvasIds.forEach(id => resizeCanvas(document.getElementById(id)));
-  window.addEventListener('resize', () => {
-    canvasIds.forEach(id => resizeCanvas(document.getElementById(id)));
-    drawAll();
-  });
-
-  function drawChart(id, key, color) {
-    const c   = document.getElementById(id);
-    const ctx = c.getContext('2d');
-    const W = c.width, H = c.height;
-    const PAD = { top:10, bottom:22, left:50, right:8 };
-    const IW = W - PAD.left - PAD.right;
-    const IH = H - PAD.top  - PAD.bottom;
-
-    ctx.clearRect(0, 0, W, H);
-    ctx.fillStyle = '#1a1a1a';
-    ctx.fillRect(0, 0, W, H);
-
-    if (buffer.length < 2) {
-      ctx.fillStyle = '#444';
-      ctx.font = '12px monospace';
-      ctx.textAlign = 'center';
-      ctx.fillText('Waiting for data...', W/2, H/2);
-      return;
-    }
-
-    // Downsample for display
-    const step = Math.max(1, Math.floor(buffer.length / MAX_DISPLAY));
-    const pts  = [];
-    for (let i = 0; i < buffer.length; i += step) pts.push(buffer[i]);
-
-    // Auto-scale Y — show at least ±0.01g so flat lines are visible
-    let mn = Infinity, mx = -Infinity;
-    pts.forEach(p => {
-      if (p[key] < mn) mn = p[key];
-      if (p[key] > mx) mx = p[key];
-    });
-    const span = Math.max(mx - mn, 0.02);
-    mn -= span * 0.1;
-    mx += span * 0.1;
-
-    // Time axis — use ESP32 timestamps (ms)
-    const t1 = pts[0].t, t2 = pts[pts.length-1].t;
-    const tSpan = Math.max(t2 - t1, 1);
-
-    // Grid + Y labels
-    ctx.strokeStyle = '#222';
-    ctx.lineWidth   = 1;
-    ctx.font        = '10px monospace';
-    ctx.fillStyle   = '#555';
-    ctx.textAlign   = 'right';
-    for (let i = 0; i <= 4; i++) {
-      const v  = mn + (mx - mn) * (i / 4);
-      const py = PAD.top + IH - (i / 4) * IH;
-      ctx.beginPath(); ctx.moveTo(PAD.left, py); ctx.lineTo(W - PAD.right, py); ctx.stroke();
-      ctx.fillText(v.toFixed(4), PAD.left - 4, py + 3);
-    }
-
-    // X time labels
-    ctx.textAlign = 'center';
-    for (let i = 0; i <= 5; i++) {
-      const t  = t1 + tSpan * (i / 5);
-      const px = PAD.left + (i / 5) * IW;
-      ctx.fillText((t / 1000).toFixed(1) + 's', px, H - 4);
-    }
-
-    // Zero line
-    if (mn < 0 && mx > 0) {
-      const py = PAD.top + IH - ((0 - mn) / (mx - mn)) * IH;
-      ctx.beginPath();
-      ctx.strokeStyle = '#333';
-      ctx.setLineDash([4, 4]);
-      ctx.moveTo(PAD.left, py); ctx.lineTo(W - PAD.right, py);
-      ctx.stroke();
-      ctx.setLineDash([]);
-    }
-
-    // Data line
-    ctx.beginPath();
-    ctx.strokeStyle = color;
-    ctx.lineWidth   = 1.5;
-    ctx.lineJoin    = 'round';
-    pts.forEach((p, i) => {
-      const px = PAD.left + ((p.t - t1) / tSpan) * IW;
-      const py = PAD.top  + IH - ((p[key] - mn) / (mx - mn)) * IH;
-      i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
-    });
-    ctx.stroke();
-
-    // Border
-    ctx.strokeStyle = '#2a2a2a';
-    ctx.lineWidth   = 1;
-    ctx.strokeRect(PAD.left, PAD.top, IW, IH);
-  }
-
-  function drawAll() {
-    canvasIds.forEach((id, i) => drawChart(id, dataKeys[i], COLORS[id]));
-  }
-
-  // ── RMS calculation over last 0.5s window ────────────────────────
-  function calcRMS() {
-    const windowSamples = ODR * 0.5;
-    const slice = buffer.slice(-windowSamples);
-    if (slice.length === 0) return 0;
-    const sumSq = slice.reduce((acc, p) => acc + p.total * p.total, 0);
-    return Math.sqrt(sumSq / slice.length);
-  }
-
-  // ── Render loop ──────────────────────────────────────────────────
-  let dirty = false;
-  function scheduleRender() {
-    if (dirty) return;
-    dirty = true;
-    requestAnimationFrame(() => {
-      dirty = false;
-      drawAll();
-      document.getElementById('count').textContent =
-        buffer.length.toLocaleString() + ' samples';
-      if (buffer.length > 1) {
-        const secs = ((buffer[buffer.length-1].t - buffer[0].t) / 1000).toFixed(1);
-        document.getElementById('duration').textContent = secs + 's stored';
-      }
-    });
-  }
-
-  // ── WebSocket ────────────────────────────────────────────────────
-  let ws;
-  function connect() {
-    ws = new WebSocket('ws://' + location.hostname + ':81');
-    ws.onopen = () => {
-      document.getElementById('status').textContent = '● Connected';
-      document.getElementById('status').className  = 'status connected';
-    };
-    ws.onclose = () => {
-      document.getElementById('status').textContent = '● Disconnected';
-      document.getElementById('status').className  = 'status disconnected';
-      setTimeout(connect, 2000);
-    };
-    ws.onmessage = (evt) => {
-      const d = JSON.parse(evt.data);
-
-      // Use ESP32 microsecond timestamp converted to ms for accuracy
-      buffer.push({ t: d.t, x: d.x, y: d.y, z: d.z, total: d.total });
-
-      // Prune old data beyond buffer limit
-      if (buffer.length > MAX_BUFFER) buffer.shift();
-
-      // Update value cards
-      document.getElementById('vx').textContent = d.x.toFixed(5);
-      document.getElementById('vy').textContent = d.y.toFixed(5);
-      document.getElementById('vz').textContent = d.z.toFixed(5);
-      document.getElementById('vt').textContent = calcRMS().toFixed(5);
-
-      // Measure actual incoming sample rate every second
-      rateCounter++;
-      const now = Date.now();
-      if (now - rateTimer >= 1000) {
-        document.getElementById('rate').textContent =
-          rateCounter + ' Hz actual';
-        rateCounter = 0;
-        rateTimer   = now;
-      }
-
-      scheduleRender();
-    };
-  }
-  connect();
-
-  // ── CSV download — uses ESP32 timestamps for accurate timing ─────
-  function downloadCSV() {
-    if (!buffer.length) { alert('No data yet.'); return; }
-    const rows = ['time_ms,x_g,y_g,z_g,total_g'];
-    buffer.forEach(r => {
-      rows.push(`${r.t.toFixed(3)},${r.x.toFixed(6)},${r.y.toFixed(6)},${r.z.toFixed(6)},${r.total.toFixed(6)}`);
-    });
-    const blob = new Blob([rows.join('\n')], { type: 'text/csv' });
-    const url  = URL.createObjectURL(blob);
-    const a    = document.createElement('a');
-    a.href = url;
-    a.download = 'vibration_' + new Date().toISOString().slice(0,19).replace(/:/g,'-') + '.csv';
-    a.click();
-    URL.revokeObjectURL(url);
-  }
-
-  function clearBuffer() {
-    buffer.length = 0;
-    canvasIds.forEach(id => {
-      const c = document.getElementById(id);
-      const ctx = c.getContext('2d');
-      ctx.clearRect(0, 0, c.width, c.height);
-    });
-    document.getElementById('count').textContent    = '0 samples';
-    document.getElementById('duration').textContent = '0s stored';
-    document.getElementById('rate').textContent     = '0 Hz';
-  }
-</script>
-</body>
-</html>
-)rawliteral";
-
-// ── SPI helpers ───────────────────────────────────────────────────────────────
-void csLow()  { digitalWrite(CS_PIN, LOW);  }
-void csHigh() { digitalWrite(CS_PIN, HIGH); }
-
-uint8_t readRegister(uint8_t reg) {
-    SPI.beginTransaction(adxl355Settings); csLow();
-    SPI.transfer((reg << 1) | 0x01);
-    uint8_t r = SPI.transfer(0x00);
-    csHigh(); SPI.endTransaction(); return r;
-}
-void writeRegister(uint8_t reg, uint8_t value) {
-    SPI.beginTransaction(adxl355Settings); csLow();
-    SPI.transfer((reg << 1) & 0xFE); SPI.transfer(value);
-    csHigh(); SPI.endTransaction();
-}
-void readRegisters(uint8_t startReg, uint8_t* buffer, uint8_t length) {
-    SPI.beginTransaction(adxl355Settings); csLow();
-    SPI.transfer((startReg << 1) | 0x01);
-    for (uint8_t i = 0; i < length; i++) buffer[i] = SPI.transfer(0x00);
-    csHigh(); SPI.endTransaction();
-}
-int32_t twosComplement20(uint32_t raw) {
-    raw &= 0x000FFFFF;
-    if (raw & 0x00080000) return (int32_t)(raw | 0xFFF00000);
-    return (int32_t)raw;
-}
-struct AccelData { float x, y, z; };
-AccelData readAcceleration() {
-    uint8_t buf[9]; readRegisters(REG_XDATA3, buf, 9);
-    AccelData data;
-    data.x = twosComplement20(((uint32_t)buf[0]<<12)|((uint32_t)buf[1]<<4)|(buf[2]>>4)) * SCALE_FACTOR_4G;
-    data.y = twosComplement20(((uint32_t)buf[3]<<12)|((uint32_t)buf[4]<<4)|(buf[5]>>4)) * SCALE_FACTOR_4G;
-    data.z = twosComplement20(((uint32_t)buf[6]<<12)|((uint32_t)buf[7]<<4)|(buf[8]>>4)) * SCALE_FACTOR_4G;
-    return data;
-}
-
-// ── Setup ─────────────────────────────────────────────────────────────────────
 void setup() {
-    Serial.begin(115200);
-    delay(2000);
+    Serial.begin(921600);
 
-    WiFi.disconnect(true); delay(500);
-    WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false);
-    WiFi.begin(SSID, PASSWORD);
-    Serial.print("Connecting to WiFi");
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500); Serial.print(".");
-        if (++attempts > 30) { Serial.println("WiFi failed"); break; }
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.print("\nDashboard: http://");
-        Serial.println(WiFi.localIP());
-        httpServer.on("/", []() {
-            httpServer.send_P(200, "text/html", INDEX_HTML);
-        });
-        httpServer.begin();
-        wsServer.begin();
+    if (!lis.begin()) {
+        Serial.println("LIS3DH not found!");
+        while (1);
     }
 
-    pinMode(CS_PIN, OUTPUT); csHigh(); delay(100);
-    SPI.begin(18, 19, 23, 5);
-    writeRegister(REG_RESET, 0x52); delay(100);
+    lis.setRange(LIS3DH_RANGE_2_G);
+    lis.setDataRate(LIS3DH_DATARATE_LOWPOWER_1K6HZ);
 
-    uint8_t devId  = readRegister(REG_DEVID_AD);
-    uint8_t mstId  = readRegister(REG_DEVID_MST);
-    uint8_t partId = readRegister(REG_PARTID);
-    Serial.printf("DEVID_AD=0x%02X  DEVID_MST=0x%02X  PARTID=0x%02X\n", devId, mstId, partId);
-    if (devId != 0xAD || mstId != 0x1D || partId != 0xED) {
-        Serial.println("ERROR: sensor not found"); while(true) delay(1000);
+    Serial.println("Calibrating — keep sensor still...");
+    delay(500);
+
+    const int CAL_SAMPLES = 500;
+    double sum_x = 0, sum_y = 0, sum_z = 0;
+
+    for (int i = 0; i < CAL_SAMPLES; i++) {
+        sensors_event_t event;
+        lis.getEvent(&event);
+        sum_x += event.acceleration.x;
+        sum_y += event.acceleration.y;
+        sum_z += event.acceleration.z;
+        delayMicroseconds(1250);
     }
 
-    writeRegister(REG_RANGE,     0x02);          // ±4g
-    writeRegister(REG_FILTER,    FILTER_200HZ_HPF); // 200 Hz ODR, HPF on
-    writeRegister(REG_POWER_CTL, 0x00);          // measurement mode
-    delay(100);
-    Serial.println("Sensor ready — 200 Hz, ±4g, HPF on");
+    bias_x = sum_x / CAL_SAMPLES;
+    bias_y = sum_y / CAL_SAMPLES;
+    bias_z = (sum_z / CAL_SAMPLES) - 9.80665f;
+
+    Serial.println("Calibration done.");
+    Serial.print("Bias X: "); Serial.println(bias_x, 4);
+    Serial.print("Bias Y: "); Serial.println(bias_y, 4);
+    Serial.print("Bias Z: "); Serial.println(bias_z, 4);
+
+    lastMicros = micros();
 }
 
-// ── Loop ──────────────────────────────────────────────────────────────────────
 void loop() {
-    httpServer.handleClient();
-    wsServer.loop();
-
-    static uint32_t lastSample = 0;
     uint32_t now = micros();
 
-    // Non-blocking 200 Hz timer — fires every 5000 µs exactly
-    if (now - lastSample >= 5000) {
-        lastSample = now;
+    if (now - lastMicros >= INTERVAL_US) {
+        lastMicros += INTERVAL_US;
 
-        if (readRegister(REG_STATUS) & 0x01) {
-            AccelData a = readAcceleration();
-            float total = sqrtf(a.x*a.x + a.y*a.y + a.z*a.z);
+        sensors_event_t event;
+        lis.getEvent(&event);
 
-            // Send ESP32 microsecond timestamp so browser has accurate timing
-            char json[110];
-            snprintf(json, sizeof(json),
-                "{\"x\":%.5f,\"y\":%.5f,\"z\":%.5f,\"total\":%.5f,\"t\":%.3f}",
-                a.x, a.y, a.z, total, now / 1000.0f);
+        float ax = event.acceleration.x - bias_x;
+        float ay = event.acceleration.y - bias_y;
+        float az = event.acceleration.z - bias_z;
 
-            wsServer.broadcastTXT(json);
-        }
+        float gx = ax / 9.80665f;
+        float gy = ay / 9.80665f;
+        float gz = az / 9.80665f;
+        float gt = sqrtf(gx*gx + gy*gy + gz*gz);
+
+        Serial.print(">X:"); Serial.println(gx, 4);
+        Serial.print(">Y:"); Serial.println(gy, 4);
+        Serial.print(">Z:"); Serial.println(gz, 4);
+        Serial.print(">T:"); Serial.println(gt, 4);
     }
 }

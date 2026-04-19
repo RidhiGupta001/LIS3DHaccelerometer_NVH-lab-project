@@ -1,0 +1,30 @@
+#include <Arduino.h>
+
+const int sourcePin = 5;   // The "Sender" wire
+const int receiverPin = 4; // The "Receiver" wire
+const int ledPin = 2;      // Onboard LED
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(sourcePin, OUTPUT);
+  digitalWrite(sourcePin, HIGH); // Constantly send 3.3V out
+
+  // INPUT_PULLDOWN keeps the pin LOW (0V) until it touches the 3.3V source
+  pinMode(receiverPin, INPUT_PULLDOWN); 
+  
+  pinMode(ledPin, OUTPUT);
+}
+
+void loop() {
+  // Check if the 3.3V signal made it to the receiver pin
+  if (digitalRead(receiverPin) == HIGH) {
+    digitalWrite(ledPin, HIGH); // Continuity! LED ON
+    Serial.println("CONNECTED");
+  } else {
+    digitalWrite(ledPin, LOW);  // Open Circuit. LED OFF
+    Serial.println("---");
+  }
+  
+  delay(100); // Stability delay
+}

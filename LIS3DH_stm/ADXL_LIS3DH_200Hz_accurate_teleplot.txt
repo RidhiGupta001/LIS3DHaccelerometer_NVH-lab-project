@@ -1,0 +1,276 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <math.h>
+#include <Adafruit_LIS3DH.h>
+#include <Adafruit_Sensor.h>
+
+// ════════════════════════════════════════════════════════════════
+//  PIN DEFINITIONS
+// ════════════════════════════════════════════════════════════════
+#define ADXL355_CS    4
+#define LIS3DH_CS     5
+#define SPI_MISO     19
+#define SPI_MOSI     23
+#define SPI_CLK      18
+
+// ════════════════════════════════════════════════════════════════
+//  SPI SPEED
+//  ADXL355: max 10MHz; LIS3DH: max 10MHz — safe at 8MHz
+// ════════════════════════════════════════════════════════════════
+#define SPI_FREQ  8000000
+
+// ════════════════════════════════════════════════════════════════
+//  ADXL355 REGISTER MAP
+// ════════════════════════════════════════════════════════════════
+#define ADXL_REG_DEVID_AD   0x00
+#define ADXL_REG_DEVID_MST  0x01
+#define ADXL_REG_PARTID     0x02
+#define ADXL_REG_REVID      0x03
+#define ADXL_REG_STATUS     0x04
+#define ADXL_REG_FIFO_ENTR  0x05
+#define ADXL_REG_TEMP2      0x06
+#define ADXL_REG_TEMP1      0x07
+#define ADXL_REG_XDATA3     0x08
+#define ADXL_REG_FILTER     0x28
+#define ADXL_REG_FIFO_SMPL  0x29  // FIFO samples (set 0 = FIFO off / bypass)
+#define ADXL_REG_INT_MAP    0x2A
+#define ADXL_REG_SYNC       0x2B
+#define ADXL_REG_RANGE      0x2C
+#define ADXL_REG_POWER_CTL  0x2D
+#define ADXL_REG_SELF_TEST  0x2E
+#define ADXL_REG_RESET      0x2F
+
+// ════════════════════════════════════════════════════════════════
+//  ADXL355 SCALING
+//  ±2g range → 3.9 µg/LSB → scale = 3.9e-6 g/count
+//  20-bit signed output: full scale = 2^19 = 524288 counts = 2g
+//  So: scale = 2.0 / 524288 = 3.8147e-6 g/LSB  (datasheet: ~3.9µg/LSB)
+// ════════════════════════════════════════════════════════════════
+#define ADXL_SCALE_2G  (2.0f / 524288.0f)   // g per LSB (±2g range)
+
+// ════════════════════════════════════════════════════════════════
+//  SAMPLING: 400Hz = 2500µs interval
+//  ADXL355 ODR register 0x04 → 500Hz (next step above 400Hz)
+//  LIS3DH  ODR set to LIS3DH_DATARATE_400_HZ  → exactly 400Hz
+// ════════════════════════════════════════════════════════════════
+const uint32_t INTERVAL_US = 2500;  // 400Hz
+uint32_t lastMicros = 0;
+
+// ════════════════════════════════════════════════════════════════
+//  OBJECTS
+// ════════════════════════════════════════════════════════════════
+Adafruit_LIS3DH lis = Adafruit_LIS3DH(LIS3DH_CS);
+SPISettings adxlSettings(SPI_FREQ, MSBFIRST, SPI_MODE0);
+
+// ════════════════════════════════════════════════════════════════
+//  ADXL355 SPI HELPERS
+//  Read protocol: (reg << 1) | 0x01
+//  Write protocol:(reg << 1) & 0xFE
+// ════════════════════════════════════════════════════════════════
+uint8_t adxlRead(uint8_t reg) {
+    uint8_t result;
+    SPI.beginTransaction(adxlSettings);
+    digitalWrite(ADXL355_CS, LOW);
+    SPI.transfer((reg << 1) | 0x01);
+    result = SPI.transfer(0x00);
+    digitalWrite(ADXL355_CS, HIGH);
+    SPI.endTransaction();
+    return result;
+}
+
+void adxlWrite(uint8_t reg, uint8_t value) {
+    SPI.beginTransaction(adxlSettings);
+    digitalWrite(ADXL355_CS, LOW);
+    SPI.transfer((reg << 1) & 0xFE);
+    SPI.transfer(value);
+    digitalWrite(ADXL355_CS, HIGH);
+    SPI.endTransaction();
+}
+
+// ════════════════════════════════════════════════════════════════
+//  ADXL355 BURST READ (9 bytes = X,Y,Z each 3 bytes)
+// ════════════════════════════════════════════════════════════════
+struct AccelData { float x, y, z, total; };
+
+AccelData readADXL355() {
+    uint8_t buf[9];
+    SPI.beginTransaction(adxlSettings);
+    digitalWrite(ADXL355_CS, LOW);
+    SPI.transfer((ADXL_REG_XDATA3 << 1) | 0x01);
+    for (uint8_t i = 0; i < 9; i++) buf[i] = SPI.transfer(0x00);
+    digitalWrite(ADXL355_CS, HIGH);
+    SPI.endTransaction();
+
+    // 20-bit two's complement extraction
+    auto twosComp20 = [](uint32_t raw) -> int32_t {
+        if (raw & 0x80000) return (int32_t)(raw | 0xFFF00000);  // sign extend bit 19
+        return (int32_t)raw;
+    };
+
+    // Each axis: [DATA3=bits19:12] [DATA2=bits11:4] [DATA1=bits3:0 in high nibble]
+    uint32_t rX = ((uint32_t)buf[0] << 12) | ((uint32_t)buf[1] << 4) | (buf[2] >> 4);
+    uint32_t rY = ((uint32_t)buf[3] << 12) | ((uint32_t)buf[4] << 4) | (buf[5] >> 4);
+    uint32_t rZ = ((uint32_t)buf[6] << 12) | ((uint32_t)buf[7] << 4) | (buf[8] >> 4);
+
+    AccelData d;
+    d.x     = twosComp20(rX) * ADXL_SCALE_2G;
+    d.y     = twosComp20(rY) * ADXL_SCALE_2G;
+    d.z     = twosComp20(rZ) * ADXL_SCALE_2G;
+    d.total = sqrtf(d.x*d.x + d.y*d.y + d.z*d.z);
+    return d;
+}
+
+// ════════════════════════════════════════════════════════════════
+//  LIS3DH HIGH-RESOLUTION MODE
+//  Set BDU + HR bit in CTRL_REG4 via raw SPI (Adafruit lib doesn't expose HR)
+//  CTRL_REG4 address: 0x23  →  BDU=1, FS=00(±2g), HR=1 → 0b10001000 = 0x88
+// ════════════════════════════════════════════════════════════════
+#define LIS3DH_CTRL_REG4  0x23
+#define LIS3DH_CTRL_REG1  0x20
+
+void lis3dhWriteReg(uint8_t reg, uint8_t value) {
+    SPI.beginTransaction(SPISettings(SPI_FREQ, MSBFIRST, SPI_MODE3));
+    digitalWrite(LIS3DH_CS, LOW);
+    SPI.transfer(reg & 0x3F);   // Write: MSB=0, Auto-inc=0
+    SPI.transfer(value);
+    digitalWrite(LIS3DH_CS, HIGH);
+    SPI.endTransaction();
+}
+
+// ════════════════════════════════════════════════════════════════
+//  SETUP INFO PRINT
+// ════════════════════════════════════════════════════════════════
+void printSensorConfig() {
+    Serial.println(F("\n╔══════════════════════════════════════════════════════╗"));
+    Serial.println(F("║         DUAL ACCELEROMETER CONFIG REPORT             ║"));
+    Serial.println(F("╠══════════════════════════════════════════════════════╣"));
+    Serial.println(F("║  ADXL355                                             ║"));
+    Serial.println(F("║  ├─ Interface     : SPI (Mode 0, MSB first)          ║"));
+    Serial.printf( "║  ├─ SPI Frequency : %d MHz                          ║\n", SPI_FREQ/1000000);
+    Serial.println(F("║  ├─ ODR Register : 0x04  → 500 Hz output            ║"));
+    Serial.println(F("║  ├─ Sample Rate  : 400 Hz (2500µs interval)          ║"));
+    Serial.println(F("║  ├─ Range        : ±2g                               ║"));
+    Serial.println(F("║  ├─ Resolution   : 20-bit signed                     ║"));
+    Serial.println(F("║  ├─ Scale Factor : 3.815 µg/LSB                     ║"));
+    Serial.println(F("║  ├─ Filter (0x28): 0x04 (HPF off, LPF@500Hz ODR)    ║"));
+    Serial.println(F("║  ├─ FIFO         : Disabled (bypass mode)            ║"));
+    Serial.println(F("║  ├─ Power Mode   : Measurement (POWER_CTL=0x00)      ║"));
+    Serial.println(F("║  └─ CS Pin       : GPIO 21                           ║"));
+    Serial.println(F("╠══════════════════════════════════════════════════════╣"));
+    Serial.println(F("║  LIS3DH                                              ║"));
+    Serial.println(F("║  ├─ Interface     : SPI (Mode 3, MSB first)          ║"));
+    Serial.printf( "║  ├─ SPI Frequency : %d MHz                          ║\n", SPI_FREQ/1000000);
+    Serial.println(F("║  ├─ ODR          : 400 Hz                            ║"));
+    Serial.println(F("║  ├─ Power Mode   : Normal (not Low Power)            ║"));
+    Serial.println(F("║  ├─ Range        : ±2g                               ║"));
+    Serial.println(F("║  ├─ Resolution   : 12-bit (High-Resolution enabled)  ║"));
+    Serial.println(F("║  ├─ Scale Factor : ~1 mg/LSB (±2g, HR mode)         ║"));
+    Serial.println(F("║  ├─ BDU          : Enabled (no register tearing)     ║"));
+    Serial.println(F("║  ├─ CTRL_REG4    : 0x88 (BDU|HR|FS=±2g)            ║"));
+    Serial.println(F("║  └─ CS Pin       : GPIO 5                            ║"));
+    Serial.println(F("╠══════════════════════════════════════════════════════╣"));
+    Serial.println(F("║  SYSTEM                                              ║"));
+    Serial.println(F("║  ├─ Target Rate  : 400 Hz                            ║"));
+    Serial.println(F("║  ├─ Interval     : 2500 µs                           ║"));
+    Serial.println(F("║  ├─ Serial Baud  : 921600                            ║"));
+    Serial.println(F("║  ├─ Output       : Teleplot format (>KEY:VALUE)      ║"));
+    Serial.println(F("║  └─ Channels     : AX,AY,AZ,AT  LX,LY,LZ,LT        ║"));
+    Serial.println(F("╚══════════════════════════════════════════════════════╝\n"));
+    delay(200);
+}
+
+// ════════════════════════════════════════════════════════════════
+//  SETUP
+// ════════════════════════════════════════════════════════════════
+void setup() {
+    Serial.begin(921600);
+    while (!Serial) delay(10);
+
+    pinMode(ADXL355_CS, OUTPUT);
+    pinMode(LIS3DH_CS,  OUTPUT);
+    digitalWrite(ADXL355_CS, HIGH);
+    digitalWrite(LIS3DH_CS,  HIGH);
+
+    SPI.begin(SPI_CLK, SPI_MISO, SPI_MOSI);
+    delay(100);
+
+    // ── ADXL355 Init ─────────────────────────────────────────
+    adxlWrite(ADXL_REG_RESET, 0x52);          // Full reset
+    delay(100);
+
+    // FILTER register 0x28:
+    //   Bits [3:0] = ODR + LPF setting
+    //   0x04 = ODR 500Hz, LPF corner = ODR/4 = 125Hz
+    //   HPF disabled (bits [6:4] = 000)
+    adxlWrite(ADXL_REG_FILTER, 0x04);
+
+    // FIFO: set samples to 0 → FIFO disabled (bypass)
+    adxlWrite(ADXL_REG_FIFO_SMPL, 0x00);
+
+    // RANGE: 0x01 = ±2g, INT active high, default INT pins
+    adxlWrite(ADXL_REG_RANGE, 0x01);
+
+    // POWER_CTL: 0x00 = measurement mode (STANDBY bit cleared)
+    adxlWrite(ADXL_REG_POWER_CTL, 0x00);
+    delay(10);
+
+    // ── LIS3DH Init ──────────────────────────────────────────
+    if (!lis.begin()) {
+        Serial.println(F("ERROR: LIS3DH not found! Check wiring."));
+        while (1) delay(100);
+    }
+
+    // Set ODR = 400Hz, Normal power, all axes enabled
+    // CTRL_REG1: ODR[3:0]=0111(400Hz) LPen=0 Zen=1 Yen=1 Xen=1 → 0x77
+    lis.setDataRate(LIS3DH_DATARATE_400_HZ);
+
+    // Set ±2g range via Adafruit lib
+    lis.setRange(LIS3DH_RANGE_2_G);
+
+    // Enable High-Resolution mode + BDU (block data update)
+    // CTRL_REG4 = 0x88: BDU=1 | BLE=0 | FS=00(±2g) | HR=1 | ST=00 | SIM=0
+    lis3dhWriteReg(LIS3DH_CTRL_REG4, 0x88);
+
+    delay(50);
+
+    printSensorConfig();
+
+    lastMicros = micros();
+}
+
+// ════════════════════════════════════════════════════════════════
+//  LOOP — runs at 400Hz
+// ════════════════════════════════════════════════════════════════
+void loop() {
+    uint32_t now = micros();
+
+    if ((uint32_t)(now - lastMicros) >= INTERVAL_US) {
+        lastMicros += INTERVAL_US;  // Drift-corrected (not = now)
+
+        // ── Read ADXL355 ─────────────────────────────────────
+        AccelData a = readADXL355();
+
+        // ── Read LIS3DH ──────────────────────────────────────
+        sensors_event_t event;
+        lis.getEvent(&event);
+
+        // Convert m/s² → g  (standard gravity = 9.80665 m/s²)
+        float lx = event.acceleration.x / 9.80665f;
+        float ly = event.acceleration.y / 9.80665f;
+        float lz = event.acceleration.z / 9.80665f;
+        float lt = sqrtf(lx*lx + ly*ly + lz*lz);
+
+        // ── Teleplot Output ───────────────────────────────────
+        // ADXL355 channels
+        Serial.printf(">ADXL_X:%.6f\n", a.x);
+        Serial.printf(">ADXL_Y:%.6f\n", a.y);
+        Serial.printf(">ADXL_Z:%.6f\n", a.z);
+        Serial.printf(">ADXL_T:%.6f\n", a.total);
+
+        // LIS3DH channels
+        Serial.printf(">LIS_X:%.4f\n", lx);
+        Serial.printf(">LIS_Y:%.4f\n", ly);
+        Serial.printf(">LIS_Z:%.4f\n", lz);
+        Serial.printf(">LIS_T:%.4f\n", lt);
+    }
+}

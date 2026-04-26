@@ -1,98 +1,116 @@
 #include <Arduino.h>
 #include <SPI.h>
-#include <Adafruit_LIS3DH.h>
+#include <math.h>
 
-// ── Timing & Pins ───────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════
+//  CONFIGURATION & PINS
+// ════════════════════════════════════════════════════════════════
 #define ADXL355_CS    4
-#define LIS3DH_CS     5
-const uint32_t INTERVAL_US = 2500; // Exact 400Hz (1,000,000 / 400)
-uint32_t nextMicros = 0;
+#define SPI_CLK      18
+#define SPI_MISO     19
+#define SPI_MOSI     23
 
-// ── Sensor Registers ─────────────────────────────────────────────
-#define ADXL_REG_FILTER     0x28 
-#define ADXL_REG_RANGE      0x2C
-#define ADXL_REG_POWER_CTL  0x2D
-#define ADXL_REG_XDATA3     0x08
-#define ADXL_SCALE          (1.0f / 256000.0f)
+#define SPI_FREQ     8000000
+#define SAMPLE_RATE_HZ 500
+#define INTERVAL_US  (1000000UL / SAMPLE_RATE_HZ) // 2000µs
+#define ADXL_SCALE_2G (2.0f / 524288.0f)          // 20-bit scaling
 
-Adafruit_LIS3DH lis = Adafruit_LIS3DH(LIS3DH_CS);
+// ADXL355 Registers
+#define REG_XDATA3    0x08
+#define REG_FILTER     0x28
+#define REG_RANGE      0x2C
+#define REG_POWER_CTL  0x2D
+#define REG_RESET      0x2F
 
-void adxlWrite(uint8_t reg, uint8_t val) {
-    SPI.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
+// ════════════════════════════════════════════════════════════════
+//  ANTI-ALIASING FILTER (2nd Order Butterworth, 200Hz Cutoff)
+// ════════════════════════════════════════════════════════════════
+struct Biquad {
+    float x1=0, x2=0, y1=0, y2=0;
+    // Coefficients for 200Hz cutoff @ 500Hz sampling
+    const float b0=0.6389f, b1=1.2779f, b2=0.6389f, a1=1.1430f, a2=0.4128f;
+    
+    float process(float x) {
+        float y = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2;
+        x2=x1; x1=x; y2=y1; y1=y;
+        return y;
+    }
+};
+
+Biquad filterX, filterY, filterZ;
+SPISettings settings(SPI_FREQ, MSBFIRST, SPI_MODE0);
+
+// ════════════════════════════════════════════════════════════════
+//  SPI FUNCTIONS
+// ════════════════════════════════════════════════════════════════
+void writeReg(uint8_t reg, uint8_t val) {
+    SPI.beginTransaction(settings);
     digitalWrite(ADXL355_CS, LOW);
-    SPI.transfer((reg << 1) & 0xFE);
+    SPI.transfer((reg << 1) | 0x00);
     SPI.transfer(val);
     digitalWrite(ADXL355_CS, HIGH);
     SPI.endTransaction();
 }
 
-void setup() {
-    // 1. Ultra-high baud rate to prevent Serial buffer stalls
-    Serial.begin(921600); 
-    while(!Serial);
+void readAccel(float &x, float &y, float &z) {
+    uint8_t buf[9];
+    SPI.beginTransaction(settings);
+    digitalWrite(ADXL355_CS, LOW);
+    SPI.transfer((REG_XDATA3 << 1) | 0x01);
+    for(int i=0; i<9; i++) buf[i] = SPI.transfer(0x00);
+    digitalWrite(ADXL355_CS, HIGH);
+    SPI.endTransaction();
 
+    auto parse20 = [](uint8_t h, uint8_t m, uint8_t l) {
+        uint32_t raw = ((uint32_t)h << 12) | ((uint32_t)m << 4) | (l >> 4);
+        if (raw & 0x80000) return (int32_t)(raw | 0xFFF00000);
+        return (int32_t)raw;
+    };
+
+    x = parse20(buf[0], buf[1], buf[2]) * ADXL_SCALE_2G;
+    y = parse20(buf[3], buf[4], buf[5]) * ADXL_SCALE_2G;
+    z = parse20(buf[6], buf[7], buf[8]) * ADXL_SCALE_2G;
+}
+
+// ════════════════════════════════════════════════════════════════
+//  MAIN
+// ════════════════════════════════════════════════════════════════
+void setup() {
+    Serial.begin(921600); // High baud rate to prevent buffer lag
     pinMode(ADXL355_CS, OUTPUT);
     digitalWrite(ADXL355_CS, HIGH);
-
-    SPI.begin(18, 19, 23);
-
-    // Init ADXL355
-    adxlWrite(0x2F, 0x52); // Reset
-    delay(100);
-    adxlWrite(ADXL_REG_FILTER, 0x04);    // 500Hz ODR (Best for 400Hz sampling)
-    adxlWrite(ADXL_REG_RANGE, 0x01);     // ±2g
-    adxlWrite(ADXL_REG_POWER_CTL, 0x00); // Measurement mode
-
-    // Init LIS3DH
-    if (lis.begin()) {
-        lis.setRange(LIS3DH_RANGE_2_G);
-        lis.setDataRate(LIS3DH_DATARATE_400_HZ); // Match 400Hz
-    }
-
-    // Print CSV Header
-    Serial.println("Timestamp_us,ADXL_X,ADXL_Y,ADXL_Z,LIS_X,LIS_Y,LIS_Z");
     
-    nextMicros = micros();
+    SPI.begin(SPI_CLK, SPI_MISO, SPI_MOSI);
+    delay(100);
+
+    writeReg(REG_RESET, 0x52);
+    delay(100);
+
+    // ODR set to 1000Hz (0x03) for internal oversampling
+    writeReg(REG_FILTER, 0x03); 
+    writeReg(REG_RANGE, 0x01);     // ±2g range
+    writeReg(REG_POWER_CTL, 0x00); // Measurement mode
+    
+    Serial.println("Timestamp_us,AccX_g,AccY_g,AccZ_g");
 }
 
 void loop() {
-    // Precise hardware-aligned timing
-    if ((int32_t)(micros() - nextMicros) >= 0) {
-        nextMicros += INTERVAL_US;
+    static uint32_t lastMicros = 0;
+    uint32_t now = micros();
 
-        // --- Read ADXL355 ---
-        uint8_t buf[9];
-        SPI.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
-        digitalWrite(ADXL355_CS, LOW);
-        SPI.transfer((ADXL_REG_XDATA3 << 1) | 0x01);
-        for(int i=0; i<9; i++) buf[i] = SPI.transfer(0x00);
-        digitalWrite(ADXL355_CS, HIGH);
-        SPI.endTransaction();
+    if (now - lastMicros >= INTERVAL_US) {
+        lastMicros += INTERVAL_US;
 
-        auto conv = [](uint32_t r) {
-            if (r & 0x80000) return (int32_t)(r | 0xFFF00000);
-            return (int32_t)r;
-        };
+        float rx, ry, rz;
+        readAccel(rx, ry, rz);
 
-        float ax = conv(((uint32_t)buf[0] << 12) | ((uint32_t)buf[1] << 4) | (buf[2] >> 4)) * ADXL_SCALE;
-        float ay = conv(((uint32_t)buf[3] << 12) | ((uint32_t)buf[4] << 4) | (buf[5] >> 4)) * ADXL_SCALE;
-        float az = conv(((uint32_t)buf[6] << 12) | ((uint32_t)buf[7] << 4) | (buf[8] >> 4)) * ADXL_SCALE;
-
-        // --- Read LIS3DH ---
-        sensors_event_t event;
-        lis.getEvent(&event);
-        float lx = event.acceleration.x / 9.80665f;
-        float ly = event.acceleration.y / 9.80665f;
-        float lz = event.acceleration.z / 9.80665f;
-
-        // --- Optimized CSV Output ---
-        // Using microsecond timestamp to verify 400Hz intervals in Excel later
-        Serial.print(micros()); Serial.print(",");
-        Serial.print(ax, 4); Serial.print(",");
-        Serial.print(ay, 4); Serial.print(",");
-        Serial.print(az, 4); Serial.print(",");
-        Serial.print(lx, 4); Serial.print(",");
-        Serial.print(ly, 4); Serial.print(",");
-        Serial.println(lz, 4);
+        // Filter data to ensure accuracy up to 200Hz
+        float fx = filterX.process(rx);
+        float fy = filterY.process(ry);
+        float fz = filterZ.process(rz);
+        float totalAcc = sqrtf(fx*fx + fy*fy + fz*fz);
+        // CSV Output
+        Serial.printf("%u,%.6f,%.6f,%.6f,%.6f\n", 
+                      lastMicros, fx, fy, fz, totalAcc);
     }
-}
+    }

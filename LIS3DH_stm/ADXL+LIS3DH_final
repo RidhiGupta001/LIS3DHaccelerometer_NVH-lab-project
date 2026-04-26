@@ -1,0 +1,126 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <math.h>
+#include <Adafruit_LIS3DH.h>
+#include <Adafruit_Sensor.h>
+
+// --- PIN DEFINITIONS ---
+#define ADXL355_CS    4
+#define LIS3DH_CS     5
+#define SPI_CLK      18
+#define SPI_MISO     19
+#define SPI_MOSI     23
+
+// --- SETTINGS ---
+#define SPI_FREQ     8000000
+#define SAMPLE_RATE_HZ 500
+#define INTERVAL_US  (1000000UL / SAMPLE_RATE_HZ) // 2000us
+#define ADXL_SCALE_2G (2.0f / 524288.0f)
+
+// ADXL355 REGISTERS
+#define ADXL_REG_FILTER     0x28
+#define ADXL_REG_RANGE      0x2C
+#define ADXL_REG_POWER_CTL  0x2D
+#define ADXL_REG_XDATA3     0x08
+#define ADXL_REG_RESET      0x2F
+
+// --- BIQUAD FILTER (200Hz Cutoff @ 500Hz Sampling) ---
+// Provides maximally flat response up to 200Hz
+struct Biquad {
+    float x1=0, x2=0, y1=0, y2=0;
+    const float b0=0.6389f, b1=1.2779f, b2=0.6389f, a1=1.1430f, a2=0.4128f;
+    float filter(float x) {
+        float y = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2;
+        x2=x1; x1=x; y2=y1; y1=y;
+        return y;
+    }
+};
+
+Biquad fA[3], fL[3]; // Filters for ADXL and LIS (X, Y, Z)
+
+// --- OBJECTS ---
+Adafruit_LIS3DH lis = Adafruit_LIS3DH(LIS3DH_CS);
+SPISettings adxlSettings(SPI_FREQ, MSBFIRST, SPI_MODE0);
+
+// --- ADXL355 MANUAL SPI HELPERS ---
+void adxlWrite(uint8_t reg, uint8_t val) {
+    SPI.beginTransaction(adxlSettings);
+    digitalWrite(ADXL355_CS, LOW);
+    SPI.transfer((reg << 1) | 0x00);
+    SPI.transfer(val);
+    digitalWrite(ADXL355_CS, HIGH);
+    SPI.endTransaction();
+}
+
+void readADXL(float &x, float &y, float &z) {
+    uint8_t buf[9];
+    SPI.beginTransaction(adxlSettings);
+    digitalWrite(ADXL355_CS, LOW);
+    SPI.transfer((ADXL_REG_XDATA3 << 1) | 0x01);
+    for(int i=0; i<9; i++) buf[i] = SPI.transfer(0x00);
+    digitalWrite(ADXL355_CS, HIGH);
+    SPI.endTransaction();
+
+    auto parse = [](uint8_t h, uint8_t m, uint8_t l) {
+        uint32_t raw = ((uint32_t)h << 12) | ((uint32_t)m << 4) | (l >> 4);
+        if (raw & 0x80000) return (int32_t)(raw | 0xFFF00000);
+        return (int32_t)raw;
+    };
+
+    x = parse(buf[0], buf[1], buf[2]) * ADXL_SCALE_2G;
+    y = parse(buf[3], buf[4], buf[5]) * ADXL_SCALE_2G;
+    z = parse(buf[6], buf[7], buf[8]) * ADXL_SCALE_2G;
+}
+
+void setup() {
+    Serial.begin(921600);
+    pinMode(ADXL355_CS, OUTPUT);
+    digitalWrite(ADXL355_CS, HIGH);
+    
+    SPI.begin(SPI_CLK, SPI_MISO, SPI_MOSI);
+
+    // ADXL355 Initialization
+    adxlWrite(ADXL_REG_RESET, 0x52);
+    delay(50);
+    // 0x03 = ODR 1000Hz (Better oversampling for 200Hz accuracy)
+    adxlWrite(ADXL_REG_FILTER, 0x03); 
+    adxlWrite(ADXL_REG_RANGE, 0x01); // ±2g
+    adxlWrite(ADXL_REG_POWER_CTL, 0x00); // Measure mode
+
+    // LIS3DH Initialization
+    if (!lis.begin()) { while(1); }
+    lis.setDataRate(LIS3DH_DATARATE_LOWPOWER_1K6HZ); // Run internal fast
+    lis.setRange(LIS3DH_RANGE_2_G);
+}
+
+void loop() {
+    static uint32_t lastMicros = 0;
+    uint32_t now = micros();
+
+    if (now - lastMicros >= INTERVAL_US) {
+        lastMicros += INTERVAL_US;
+
+        // 1. READ RAW DATA
+        float ax, ay, az;
+        readADXL(ax, ay, az);
+
+        sensors_event_t event;
+        lis.getEvent(&event);
+        float lx = event.acceleration.x / 9.80665f;
+        float ly = event.acceleration.y / 9.80665f;
+        float lz = event.acceleration.z / 9.80665f;
+
+        // 2. APPLY ANTI-ALIASING FILTERS (Crucial for 200Hz accuracy)
+        float fax = fA[0].filter(ax);
+        float fay = fA[1].filter(ay);
+        float faz = fA[2].filter(az);
+
+        float flx = fL[0].filter(lx);
+        float fly = fL[1].filter(ly);
+        float flz = fL[2].filter(lz);
+
+        // 3. OUTPUT (Teleplot Format)
+        Serial.printf(">ADXL_X:%.5f\n>ADXL_Y:%.5f\n>ADXL_Z:%.5f\n", fax, fay, faz);
+        Serial.printf(">LIS_X:%.4f\n>LIS_Y:%.4f\n>LIS_Z:%.4f\n", flx, fly, flz);
+    }
+}

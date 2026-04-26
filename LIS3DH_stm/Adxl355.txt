@@ -2,126 +2,273 @@
 #include <SPI.h>
 #include <math.h>
 
-#define CS_PIN    5
-#define SPI_FREQ  1000000
+// ════════════════════════════════════════════════════════════════
+//  PIN & TIMING CONFIGURATION
+// ════════════════════════════════════════════════════════════════
+#define ADXL355_CS    4
+#define SPI_CLK      18
+#define SPI_MISO     19
+#define SPI_MOSI     23
 
-#define REG_DEVID_AD    0x00
-#define REG_DEVID_MST   0x01
-#define REG_PARTID      0x02
-#define REG_STATUS      0x04
-#define REG_TEMP2       0x06
-#define REG_XDATA3      0x08
-#define REG_FILTER      0x28
-#define REG_RANGE       0x2C
-#define REG_POWER_CTL   0x2D
-#define REG_RESET       0x2F
+#define SPI_FREQ     8000000            // 8MHz SPI speed
+#define SAMPLE_RATE  500                // 500 Hz Sampling
+#define INTERVAL_US  (1000000UL / SAMPLE_RATE) 
+#define SCALE_2G     (2.0f / 524288.0f) // 20-bit scaling for ±2g
 
-#define SCALE_FACTOR_2G (1.0f / 256000.0f)
+// ADXL355 Register Map
+#define REG_XDATA3    0x08
+#define REG_FILTER     0x28
+#define REG_RANGE      0x2C
+#define REG_POWER_CTL  0x2D
+#define REG_RESET      0x2F
 
-SPISettings adxl355Settings(SPI_FREQ, MSBFIRST, SPI_MODE0);
-
-void csLow()  { digitalWrite(CS_PIN, LOW);  }
-void csHigh() { digitalWrite(CS_PIN, HIGH); }
-
-uint8_t readRegister(uint8_t reg) {
-    SPI.beginTransaction(adxl355Settings);
-    csLow();
-    SPI.transfer((reg << 1) | 0x01);
-    uint8_t result = SPI.transfer(0x00);
-    csHigh();
-    SPI.endTransaction();
-    return result;
-}
-
-void writeRegister(uint8_t reg, uint8_t value) {
-    SPI.beginTransaction(adxl355Settings);
-    csLow();
-    SPI.transfer((reg << 1) & 0xFE);
-    SPI.transfer(value);
-    csHigh();
-    SPI.endTransaction();
-}
-
-void readRegisters(uint8_t startReg, uint8_t* buffer, uint8_t length) {
-    SPI.beginTransaction(adxl355Settings);
-    csLow();
-    SPI.transfer((startReg << 1) | 0x01);
-    for (uint8_t i = 0; i < length; i++) buffer[i] = SPI.transfer(0x00);
-    csHigh();
-    SPI.endTransaction();
-}
-
-int32_t twosComplement20(uint32_t raw) {
-    raw &= 0x000FFFFF;
-    if (raw & 0x00080000) return (int32_t)(raw | 0xFFF00000);
-    return (int32_t)raw;
-}
-
-struct AccelData { float x, y, z; };
-
-AccelData readAcceleration() {
-    uint8_t buf[9];
-    readRegisters(REG_XDATA3, buf, 9);
-    AccelData data;
-    data.x = twosComplement20(((uint32_t)buf[0] << 12) | ((uint32_t)buf[1] << 4) | (buf[2] >> 4)) * SCALE_FACTOR_2G;
-    data.y = twosComplement20(((uint32_t)buf[3] << 12) | ((uint32_t)buf[4] << 4) | (buf[5] >> 4)) * SCALE_FACTOR_2G;
-    data.z = twosComplement20(((uint32_t)buf[6] << 12) | ((uint32_t)buf[7] << 4) | (buf[8] >> 4)) * SCALE_FACTOR_2G;
-    return data;
-}
-
-float readTemperature() {
-    uint8_t t[2];
-    readRegisters(REG_TEMP2, t, 2);
-    uint16_t raw = ((uint16_t)(t[0] & 0x0F) << 8) | t[1];
-    return 25.0f + ((float)raw - 1885.0f) / (-9.05f);
-}
-
-void setup() {
-    Serial.begin(115200);
-    delay(2000);
-    Serial.println("Starting...");
-
-    pinMode(CS_PIN, OUTPUT);
-    csHigh();
-    delay(100);
-
-    SPI.begin(18, 19, 23, 5);
-    Serial.println("SPI initialized");
-
-    writeRegister(REG_RESET, 0x52);
-    delay(100);
-    Serial.println("Reset done");
-
-    uint8_t devId  = readRegister(REG_DEVID_AD);
-    uint8_t mstId  = readRegister(REG_DEVID_MST);
-    uint8_t partId = readRegister(REG_PARTID);
-    Serial.printf("DEVID_AD  : 0x%02X (expect 0xAD)\n", devId);
-    Serial.printf("DEVID_MST : 0x%02X (expect 0x1D)\n", mstId);
-    Serial.printf("PART ID   : 0x%02X (expect 0xED)\n", partId);
-
-    if (devId != 0xAD || mstId != 0x1D || partId != 0xED) {
-        Serial.println("ERROR: ADXL355 not found!");
-        while (true) delay(1000);
+// ════════════════════════════════════════════════════════════════
+//  ANTI-ALIASING FILTER (Butterworth 2nd Order, 200Hz Cutoff)
+// ════════════════════════════════════════════════════════════════
+struct BiquadFilter {
+    float x1=0, x2=0, y1=0, y2=0;
+    // Coefficients calculated for Fc=200Hz @ Fs=500Hz
+    const float b0=0.6389f, b1=1.2779f, b2=0.6389f, a1=1.1430f, a2=0.4128f;
+    
+    float process(float x) {
+        float y = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2;
+        x2 = x1; x1 = x; y2 = y1; y1 = y;
+        return y;
     }
+};
 
-    writeRegister(REG_RANGE,     0x01);  // ±2g
-    writeRegister(REG_FILTER,    0x33);  // ODR 500Hz, LPF 125Hz, HPF 0.08Hz (removes gravity)
-    writeRegister(REG_POWER_CTL, 0x00);  // measurement mode
+BiquadFilter fX, fY, fZ;
+SPISettings adxlSettings(SPI_FREQ, MSBFIRST, SPI_MODE0);
+
+// ════════════════════════════════════════════════════════════════
+//  SPI LOW-LEVEL ACCESS
+// ════════════════════════════════════════════════════════════════
+void adxlWrite(uint8_t reg, uint8_t val) {
+    SPI.beginTransaction(adxlSettings);
+    digitalWrite(ADXL355_CS, LOW);
+    SPI.transfer((reg << 1) | 0x00); // Write bit = 0
+    SPI.transfer(val);
+    digitalWrite(ADXL355_CS, HIGH);
+    SPI.endTransaction();
+}
+
+void readAccel(float &x, float &y, float &z) {
+    uint8_t buf[9];
+    SPI.beginTransaction(adxlSettings);
+    digitalWrite(ADXL355_CS, LOW);
+    SPI.transfer((REG_XDATA3 << 1) | 0x01); // Read bit = 1
+    for(int i=0; i<9; i++) buf[i] = SPI.transfer(0x00);
+    digitalWrite(ADXL355_CS, HIGH);
+    SPI.endTransaction();
+
+    auto parse20 = [](uint8_t h, uint8_t m, uint8_t l) {
+        uint32_t raw = ((uint32_t)h << 12) | ((uint32_t)m << 4) | (l >> 4);
+        if (raw & 0x80000) return (int32_t)(raw | 0xFFF00000); // Sign extend
+        return (int32_t)raw;
+    };
+
+    x = parse20(buf[0], buf[1], buf[2]) * SCALE_2G;
+    y = parse20(buf[3], buf[4], buf[5]) * SCALE_2G;
+    z = parse20(buf[6], buf[7], buf[8]) * SCALE_2G;
+}
+
+// ════════════════════════════════════════════════════════════════
+//  EXECUTION
+// ════════════════════════════════════════════════════════════════
+void setup() {
+    Serial.begin(921600); // High baud rate is essential for 500Hz
+    pinMode(ADXL355_CS, OUTPUT);
+    digitalWrite(ADXL355_CS, HIGH);
+    
+    SPI.begin(SPI_CLK, SPI_MISO, SPI_MOSI);
     delay(100);
 
-    Serial.println("Setup complete, entering loop...");
+    adxlWrite(REG_RESET, 0x52); // Soft reset
+    delay(100);
+
+    // 0x03 = ODR 1000Hz. Higher internal ODR reduces latency.
+    adxlWrite(REG_FILTER, 0x03); 
+    adxlWrite(REG_RANGE, 0x01);     // ±2g
+    adxlWrite(REG_POWER_CTL, 0x00); // Start measurement mode
+    
+    Serial.println("Timestamp_us,AccX_g,AccY_g,AccZ_g,Total_g");
 }
 
 void loop() {
-    if (readRegister(REG_STATUS) & 0x01) {  // DATA_RDY
-        AccelData a = readAcceleration();
-        float total = sqrtf(a.x*a.x + a.y*a.y + a.z*a.z);
-        Serial.printf(">Ax:%f\n", a.x);
-        Serial.printf(">Ay:%f\n", a.y);
-        Serial.printf(">Az:%f\n", a.z);
-        Serial.printf(">Atotal:%f\n", total);
+    static uint32_t lastMicros = 0;
+    uint32_t now = micros();
 
-       
+    // Strict timing loop
+    if (now - lastMicros >= INTERVAL_US) {
+        lastMicros += INTERVAL_US;
+
+        float rx, ry, rz;
+        readAccel(rx, ry, rz);
+
+        // Filter signals to preserve 0-200Hz and suppress noise
+        float fx = fX.process(rx);
+        float fy = fY.process(ry);
+        float fz = fZ.process(rz);
+
+        // Resultant vector magnitude
+        float total = sqrtf(fx*fx + fy*fy + fz*fz);
+
+        // CSV Output
+        Serial.printf(">AccX:%.6f\n>AccY:%.6f\n>AccZ:%.6f\n>Total:%.6f\n", 
+                      fx, fy, fz, total);
+        
     }
-    delay(2);  // 2ms matches 500 Hz ODR
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <math.h>
+
+// ════════════════════════════════════════════════════════════════
+//  CONFIGURATION & PINS
+// ════════════════════════════════════════════════════════════════
+#define ADXL355_CS    4
+#define SPI_CLK      18
+#define SPI_MISO     19
+#define SPI_MOSI     23
+
+#define SPI_FREQ     8000000
+#define SAMPLE_RATE_HZ 500
+#define INTERVAL_US  (1000000UL / SAMPLE_RATE_HZ) // 2000µs
+#define ADXL_SCALE_2G (2.0f / 524288.0f)          // 20-bit scaling
+
+// ADXL355 Registers
+#define REG_XDATA3    0x08
+#define REG_FILTER     0x28
+#define REG_RANGE      0x2C
+#define REG_POWER_CTL  0x2D
+#define REG_RESET      0x2F
+
+// ════════════════════════════════════════════════════════════════
+//  ANTI-ALIASING FILTER (2nd Order Butterworth, 200Hz Cutoff)
+// ════════════════════════════════════════════════════════════════
+struct Biquad {
+    float x1=0, x2=0, y1=0, y2=0;
+    // Coefficients for 200Hz cutoff @ 500Hz sampling
+    const float b0=0.6389f, b1=1.2779f, b2=0.6389f, a1=1.1430f, a2=0.4128f;
+    
+    float process(float x) {
+        float y = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2;
+        x2=x1; x1=x; y2=y1; y1=y;
+        return y;
+    }
+};
+
+Biquad filterX, filterY, filterZ;
+SPISettings settings(SPI_FREQ, MSBFIRST, SPI_MODE0);
+
+// ════════════════════════════════════════════════════════════════
+//  SPI FUNCTIONS
+// ════════════════════════════════════════════════════════════════
+void writeReg(uint8_t reg, uint8_t val) {
+    SPI.beginTransaction(settings);
+    digitalWrite(ADXL355_CS, LOW);
+    SPI.transfer((reg << 1) | 0x00);
+    SPI.transfer(val);
+    digitalWrite(ADXL355_CS, HIGH);
+    SPI.endTransaction();
+}
+
+void readAccel(float &x, float &y, float &z) {
+    uint8_t buf[9];
+    SPI.beginTransaction(settings);
+    digitalWrite(ADXL355_CS, LOW);
+    SPI.transfer((REG_XDATA3 << 1) | 0x01);
+    for(int i=0; i<9; i++) buf[i] = SPI.transfer(0x00);
+    digitalWrite(ADXL355_CS, HIGH);
+    SPI.endTransaction();
+
+    auto parse20 = [](uint8_t h, uint8_t m, uint8_t l) {
+        uint32_t raw = ((uint32_t)h << 12) | ((uint32_t)m << 4) | (l >> 4);
+        if (raw & 0x80000) return (int32_t)(raw | 0xFFF00000);
+        return (int32_t)raw;
+    };
+
+    x = parse20(buf[0], buf[1], buf[2]) * ADXL_SCALE_2G;
+    y = parse20(buf[3], buf[4], buf[5]) * ADXL_SCALE_2G;
+    z = parse20(buf[6], buf[7], buf[8]) * ADXL_SCALE_2G;
+}
+
+// ════════════════════════════════════════════════════════════════
+//  MAIN
+// ════════════════════════════════════════════════════════════════
+void setup() {
+    Serial.begin(921600); // High baud rate to prevent buffer lag
+    pinMode(ADXL355_CS, OUTPUT);
+    digitalWrite(ADXL355_CS, HIGH);
+    
+    SPI.begin(SPI_CLK, SPI_MISO, SPI_MOSI);
+    delay(100);
+
+    writeReg(REG_RESET, 0x52);
+    delay(100);
+
+    // ODR set to 1000Hz (0x03) for internal oversampling
+    writeReg(REG_FILTER, 0x03); 
+    writeReg(REG_RANGE, 0x01);     // ±2g range
+    writeReg(REG_POWER_CTL, 0x00); // Measurement mode
+    
+    Serial.println("Timestamp_us,AccX_g,AccY_g,AccZ_g");
+}
+
+void loop() {
+    static uint32_t lastMicros = 0;
+    uint32_t now = micros();
+
+    if (now - lastMicros >= INTERVAL_US) {
+        lastMicros += INTERVAL_US;
+
+        float rx, ry, rz;
+        readAccel(rx, ry, rz);
+
+        // Filter data to ensure accuracy up to 200Hz
+        float fx = filterX.process(rx);
+        float fy = filterY.process(ry);
+        float fz = filterZ.process(rz);
+        float totalAcc = sqrtf(fx*fx + fy*fy + fz*fz);
+        // CSV Output
+        Serial.printf("%u,%.6f,%.6f,%.6f,%.6f\n", 
+                      lastMicros, fx, fy, fz, totalAcc);
+    }
+    }
